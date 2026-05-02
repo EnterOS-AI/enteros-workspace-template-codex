@@ -1,0 +1,72 @@
+name: OpenAI Codex CLI
+description: >-
+  OpenAI Codex CLI (@openai/codex) wrapped as a Molecule workspace runtime.
+  Each session holds a long-lived `codex app-server` child + one thread,
+  so A2A messages process in-order with full conversation continuity —
+  no fresh subprocess per turn.
+
+  Provider is OpenAI (codex is OpenAI-only). Set OPENAI_API_KEY in the
+  workspace's environment via the canvas Config tab.
+version: 0.1.0
+tier: 2
+
+runtime: codex
+runtime_config:
+  # Default codex model. Pass-through to `thread/start`'s `model`
+  # field; codex resolves the rest. Leave empty to use codex's own
+  # default (currently gpt-5, but tracks codex CLI releases).
+  model: gpt-5
+
+  # Models surfaced in the canvas Config tab dropdown. All require
+  # OPENAI_API_KEY since codex is OpenAI-only.
+  models:
+    - id: gpt-5
+      name: GPT-5
+      required_env: [OPENAI_API_KEY]
+    - id: gpt-5-mini
+      name: GPT-5 mini
+      required_env: [OPENAI_API_KEY]
+    - id: o4-mini
+      name: o4-mini (reasoning)
+      required_env: [OPENAI_API_KEY]
+    - id: gpt-4o
+      name: GPT-4o
+      required_env: [OPENAI_API_KEY]
+
+  # All codex models share this requirement.
+  required_env: [OPENAI_API_KEY]
+
+  # Single-provider runtime; surfaced as the only entry in the canvas
+  # Provider dropdown.
+  providers:
+    - openai
+
+  # 0 = no executor-side timeout. Per-turn timeout is enforced inside
+  # executor.py at _TURN_TIMEOUT (currently 600s).
+  timeout: 0
+
+# codex's tool set is built-in (file ops, terminal, apply_patch, web
+# fetch). No extension surface from our side today.
+skills: []
+
+a2a:
+  port: 8000
+  streaming: true
+  push_notifications: true
+
+# Bridge config — consumed by executor.py.
+bridge:
+  # codex app-server is a stdio child, not a network service. No URL
+  # or port to configure. Listed here for symmetry with hermes' bridge
+  # block; when we add overrides (e.g. custom codex binary path) they
+  # land here.
+  app_server_command: codex
+  app_server_args: ["app-server"]
+
+delegation:
+  retry_attempts: 3
+  retry_delay: 5
+  timeout: 120
+  escalate: true
+
+template_schema_version: 1
