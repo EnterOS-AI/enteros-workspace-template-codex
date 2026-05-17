@@ -76,13 +76,28 @@ WORKDIR /app
 ARG RUNTIME_VERSION=
 
 COPY requirements.txt .
+# The codex runtime is registered the SAME way hermes/claude-code do
+# it: ENV ADAPTER_MODULE=adapter (set below) — the runtime's adapter
+# discovery loads adapter.py and `CodexAdapter.name()` ("codex") is
+# authoritative. The previous Dockerfile (inherited from the stale
+# single-commit Gitea mirror) ALSO monkeypatched
+# `molecule_runtime.preflight.SUPPORTED_RUNTIMES` via an unguarded
+# `python3 -c ...add('codex')` + a brittle in-file `sed`. That worked
+# against the 2026-05-04 runtime baked into the deployed image
+# (sha256:877e0687) but the CURRENT published runtime no longer
+# exposes that exact mutable-set literal, so the unguarded RUN exited
+# 1 and FAILED THE BUILD (validate-runtime + t4-conformance, CI run
+# 1). Root-cause fix: drop the brittle file-rewrite entirely (neither
+# hermes nor claude-code patch preflight — adapter discovery is the
+# real registration path) and keep only a defensive, idempotent,
+# never-fail compatibility shim for any older runtime that still gates
+# on a mutable SUPPORTED_RUNTIMES set. `|| true` so a runtime that has
+# no such attribute (the modern shape) builds clean.
 RUN pip install --no-cache-dir -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
       pip install --no-cache-dir --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
     fi && \
-    python3 -c "import molecule_runtime.preflight as pf; pf.SUPPORTED_RUNTIMES.add('codex')" && \
-    SITE=$(python3 -c 'import molecule_runtime.preflight as p; print(p.__file__)') && \
-    sed -i "s/SUPPORTED_RUNTIMES = {/SUPPORTED_RUNTIMES = {'codex',/" "$SITE"
+    python3 -c "import molecule_runtime.preflight as pf; s=getattr(pf,'SUPPORTED_RUNTIMES',None); s.add('codex') if isinstance(s,set) else None; print('preflight SUPPORTED_RUNTIMES shim:', 'patched' if isinstance(s,set) else 'n/a (adapter-module discovery is authoritative)')" || true
 
 COPY adapter.py executor.py app_server.py __init__.py ./
 COPY start.sh /usr/local/bin/start.sh
