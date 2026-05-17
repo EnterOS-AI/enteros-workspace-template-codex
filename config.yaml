@@ -13,27 +13,45 @@ tier: 2
 runtime: codex
 runtime_config:
   # Default codex model. Pass-through to `thread/start`'s `model`
-  # field; codex resolves the rest. Leave empty to use codex's own
-  # default (currently gpt-5, but tracks codex CLI releases).
-  model: gpt-5
+  # field; codex resolves the rest. `gpt-5.5` is codex 0.130's own
+  # `thread/start` default (verified live 2026-05-17 against
+  # codex-cli 0.130.0 linux/amd64: thread/start returned
+  # "model":"gpt-5.5"). The prior `gpt-5` default was a DEAD id —
+  # there is no plain `gpt-5` in the May-2026 codex roster, so a
+  # workspace on the OpenAI leg failed/hung the first turn. Roster
+  # below is the verified May-2026 set (OpenAI Codex Models +
+  # Configuration Reference). Tracks codex CLI releases — bump
+  # deliberately alongside the @openai/codex pin (RFC §1, §6).
+  model: gpt-5.5
 
-  # Models surfaced in the canvas Config tab dropdown. All require
-  # OPENAI_API_KEY since codex is OpenAI-only.
+  # Models surfaced in the canvas Config tab dropdown. The
+  # OPENAI_API_KEY requirement is the direct-OpenAI path; the
+  # MiniMax (codex_minimax_config.sh) and the single-runner
+  # ChatGPT-subscription auth.json paths satisfy auth without it
+  # (see adapter.setup() / start.sh). required_env stays declared
+  # for the canvas dropdown UX on the direct path.
   models:
-    - id: gpt-5
-      name: GPT-5
+    - id: gpt-5.5
+      name: GPT-5.5
       required_env: [OPENAI_API_KEY]
-    - id: gpt-5-mini
-      name: GPT-5 mini
+    - id: gpt-5.4
+      name: GPT-5.4
       required_env: [OPENAI_API_KEY]
-    - id: o4-mini
-      name: o4-mini (reasoning)
+    - id: gpt-5.4-mini
+      name: GPT-5.4 mini
       required_env: [OPENAI_API_KEY]
-    - id: gpt-4o
-      name: GPT-4o
+    - id: gpt-5.3-codex
+      name: GPT-5.3 Codex
+      required_env: [OPENAI_API_KEY]
+    - id: gpt-5.3-codex-spark
+      name: GPT-5.3 Codex Spark
+      required_env: [OPENAI_API_KEY]
+    - id: gpt-5.2
+      name: GPT-5.2
       required_env: [OPENAI_API_KEY]
 
-  # All codex models share this requirement.
+  # All codex models share this requirement on the direct-OpenAI
+  # path. MiniMax / ChatGPT-auth.json paths are gated separately.
   required_env: [OPENAI_API_KEY]
 
   # Single-provider runtime; surfaced as the only entry in the canvas

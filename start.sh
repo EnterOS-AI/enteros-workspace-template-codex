@@ -93,14 +93,57 @@ elif [ -f /app/codex_mcp_config.sh ]; then
   HOME=/home/agent CODEX_HOME=/home/agent/.codex \
     bash /app/codex_mcp_config.sh
 fi
+# --- Mode C: headless ChatGPT-subscription auth (single-runner only) ---
+# When CODEX_CHATGPT_AUTH_JSON is set (the CONTENTS of a codex
+# `auth.json`, auth_mode:chatgpt, injected via the workspace Config tab
+# secret for EXACTLY ONE runner — the future combined Reviewer+
+# Researcher box on the CTO's ChatGPT subscription), write it to
+# $CODEX_HOME/auth.json so codex authenticates off the subscription
+# instead of OPENAI_API_KEY. Codex's documented headless refresh
+# (refresh-and-retry on 401, rewrites auth.json in place) handles token
+# rotation; the persistent /home/agent volume keeps the refreshed file.
+# We deliberately add NO refresh daemon — OpenAI's supported CI/CD
+# pattern is "run codex and persist the updated auth.json", not a
+# manual refresh endpoint (RFC §5).
+#
+# Inert when CODEX_CHATGPT_AUTH_JSON is unset: the OPENAI_API_KEY and
+# MiniMax paths above are byte-unchanged. This is SINGLE-RUNNER only;
+# there is intentionally no multi-workspace credential fanout (RFC §5,
+# §8) — one auth.json per runner, never shared across concurrent jobs.
+if [ -n "${CODEX_CHATGPT_AUTH_JSON:-}" ]; then
+  CODEX_HOME_DIR="/home/agent/.codex"
+  install -d -o agent -g agent "$CODEX_HOME_DIR"
+  AUTH_JSON_PATH="${CODEX_HOME_DIR}/auth.json"
+  # Write the injected contents verbatim. printf %s avoids any
+  # interpretation of backslashes/format chars in the token blob.
+  printf '%s' "${CODEX_CHATGPT_AUTH_JSON}" > "$AUTH_JSON_PATH"
+  chown agent:agent "$AUTH_JSON_PATH"
+  chmod 0600 "$AUTH_JSON_PATH"
+  # Ensure codex reads file-backed credentials (not the OS keyring,
+  # which is absent in the container). Append to config.toml only if
+  # the key isn't already present so we don't fight the minimax helper.
+  CONFIG_TOML="${CODEX_HOME_DIR}/config.toml"
+  touch "$CONFIG_TOML"
+  if ! grep -qE '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=' "$CONFIG_TOML"; then
+    printf 'cli_auth_credentials_store = "file"\n' >> "$CONFIG_TOML"
+  fi
+  if ! grep -qE '^[[:space:]]*forced_login_method[[:space:]]*=' "$CONFIG_TOML"; then
+    printf 'forced_login_method = "chatgpt"\n' >> "$CONFIG_TOML"
+  fi
+  chown agent:agent "$CONFIG_TOML"
+  echo "[start.sh] chatgpt-auth: wrote ${AUTH_JSON_PATH} (0600 agent) + config.toml file-store keys (single-runner)"
+fi
+
 # Reapply ownership in case the helpers wrote into agent's home as root.
 chown -R agent:agent /home/agent/.codex 2>/dev/null || true
 
-# Provider preflight: at least one of OPENAI_API_KEY or MINIMAX_API_KEY
-# must be set. The adapter's setup() also checks but surfacing here
-# gives operators a clearer signal in container logs.
-if [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${MINIMAX_API_KEY:-}" ]; then
-  echo "[start.sh] WARN: neither OPENAI_API_KEY nor MINIMAX_API_KEY set. Workspace will fail preflight." >&2
+# Provider preflight: at least one of OPENAI_API_KEY, MINIMAX_API_KEY,
+# or an injected ChatGPT-subscription auth.json must be present. The
+# adapter's setup() also checks but surfacing here gives operators a
+# clearer signal in container logs.
+if [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${MINIMAX_API_KEY:-}" ] \
+   && [ ! -s "/home/agent/.codex/auth.json" ]; then
+  echo "[start.sh] WARN: no OPENAI_API_KEY, MINIMAX_API_KEY, nor ~/.codex/auth.json. Workspace will fail preflight." >&2
 fi
 
 # Hand off to molecule-runtime. From here, every A2A message routes

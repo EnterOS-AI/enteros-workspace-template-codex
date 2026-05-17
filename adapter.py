@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from pathlib import Path
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
 
@@ -53,8 +54,10 @@ class CodexAdapter(BaseAdapter):
             "model": {
                 "type": "string",
                 "description": (
-                    "Codex model. Pass through to `thread/start`. Common: "
-                    "'gpt-5', 'gpt-5-mini', 'o4-mini'. Empty = codex default."
+                    "Codex model. Pass through to `thread/start`. May-2026 "
+                    "roster: 'gpt-5.5' (default), 'gpt-5.4', 'gpt-5.4-mini', "
+                    "'gpt-5.3-codex', 'gpt-5.3-codex-spark', 'gpt-5.2'. "
+                    "Empty = codex default (gpt-5.5)."
                 ),
             },
         }
@@ -74,24 +77,35 @@ class CodexAdapter(BaseAdapter):
                 "outside the container, install it with: "
                 "`npm install -g @openai/codex`"
             )
-        # Auth: codex defaults to OpenAI direct, which needs
-        # OPENAI_API_KEY. The opt-in LiteLLM bridge (codex_bridge.sh)
-        # lets the workspace point codex at a chat-completions provider
-        # like MiniMax — in that mode the operator sets MINIMAX_API_KEY
-        # instead, the bridge starts a litellm proxy + writes a fake
-        # OPENAI_API_KEY that satisfies codex's env_key requirement.
-        # Accept either credential here; the bridge script handles the
-        # actual provider routing.
+        # Auth: codex resolves credentials in three ways and any one
+        # is sufficient. Mirror that here so setup() does not
+        # false-fail a validly-authed workspace:
+        #   A. OPENAI_API_KEY  — direct OpenAI path (codex default).
+        #   B. MINIMAX_API_KEY — MiniMax chat-wire route
+        #      (codex_minimax_config.sh writes config.toml).
+        #   C. $CODEX_HOME/auth.json — an injected
+        #      ChatGPT-subscription credential (auth_mode:chatgpt),
+        #      written by start.sh from CODEX_CHATGPT_AUTH_JSON for a
+        #      SINGLE runner. Codex prefers auth.json over env keys.
+        # CODEX_HOME defaults to ~/.codex; honor an explicit override
+        # so a non-default home is still detected.
+        codex_home = os.environ.get("CODEX_HOME") or os.path.join(
+            os.path.expanduser("~"), ".codex"
+        )
+        auth_json = Path(codex_home) / "auth.json"
+        has_auth_json = auth_json.is_file() and auth_json.stat().st_size > 0
         if not (
             os.environ.get("OPENAI_API_KEY")
             or os.environ.get("MINIMAX_API_KEY")
+            or has_auth_json
         ):
             raise RuntimeError(
-                "Neither OPENAI_API_KEY nor MINIMAX_API_KEY is set. "
-                "Codex needs at least one provider credential — set "
-                "OPENAI_API_KEY for direct OpenAI use, or "
-                "MINIMAX_API_KEY to route through the LiteLLM bridge "
-                "(see codex_bridge.sh). Configure via the canvas "
+                "No codex credential found. Codex needs exactly one "
+                "of: OPENAI_API_KEY (direct OpenAI), MINIMAX_API_KEY "
+                "(MiniMax chat-wire route), or an injected "
+                "ChatGPT-subscription auth.json at "
+                f"{auth_json} (set CODEX_CHATGPT_AUTH_JSON for a "
+                "single-runner workspace). Configure via the canvas "
                 "Config tab."
             )
 
