@@ -6,11 +6,37 @@
 #
 # Source: https://platform.minimax.io/docs/token-plan/codex-cli
 #
-# Codex 0.72's WireApi enum has TWO variants — `responses` and `chat`
-# (verified against codex-rs/core/src/model_provider_info.rs at
-# rust-v0.72.0). Earlier upstream config-reference docs claimed only
-# `responses` was supported; that was incorrect. Direct chat/completions
-# routing works without any proxy in the loop.
+# WIRE_API CONTRACT (codex CLI 0.130, baked by #219 — internal#513):
+# codex CLI 0.130 REMOVED the `chat` WireApi variant entirely (the
+# OpenAI Chat Completions wire was dropped fleet-wide in Feb 2026,
+# https://github.com/openai/codex/discussions/7782). 0.130 hard-fails
+# config.toml parsing with
+#   `wire_api = "chat"` is no longer supported. set `wire_api = "responses"`
+# at the line that holds it — BEFORE auth.json / OPENAI_API_KEY is even
+# read. So `chat` is invalid UNCONDITIONALLY for every provider block
+# under 0.130; it is no longer a per-provider choice. We therefore emit
+# `wire_api = "responses"` (the only parse-valid value on this CLI).
+#
+# PROD IMPACT: the production codex agents (Reviewer/Researcher) run the
+# ChatGPT/Codex *subscription* OAuth path (CODEX_AUTH_JSON → ~/.codex/
+# auth.json, model gpt-5.5). That is the OpenAI provider, which natively
+# requires the Responses API on 0.130 — so `responses` is exactly
+# correct for the path prod actually uses.
+#
+# KNOWN MINIMAX LIMITATION (documented, out of scope for internal#513):
+# MiniMax's token-plan endpoint (https://api.minimax.io/v1) is an
+# OpenAI *Chat Completions*-compatible API; per MiniMax's own codex-cli
+# docs it does NOT serve the OpenAI Responses API. With `chat` removed
+# from the CLI there is no parse-valid wire that MiniMax natively
+# accepts on 0.130 — the MiniMax token-plan route needs its own
+# follow-up (a Responses→Chat translation shim, or MiniMax shipping
+# Responses support). We still write `responses` here so the config
+# PARSES (the alternative is a non-loadable config that bricks every
+# boot, incl. the subscription path). This is acceptable because no
+# prod agent uses the MiniMax leg today (subscription is `Preferred`
+# per README; OPENAI_API_KEY is the documented fallback) — both of
+# those are native Responses providers. Tracked: see PR body / a
+# dedicated follow-up issue for the MiniMax-Responses gap.
 #
 # When MINIMAX_API_KEY is missing this is a no-op so OpenAI-direct
 # users see no behavior change.
@@ -44,7 +70,13 @@ model_provider = "minimax"
 name = "MiniMax Chat Completions API"
 base_url = "${BASE_URL}"
 env_key = "MINIMAX_API_KEY"
-wire_api = "chat"
+# codex CLI 0.130 removed the `chat` WireApi variant — `responses` is
+# the only parse-valid value (internal#513). See header note for the
+# known MiniMax-Responses limitation; this keeps config.toml loadable
+# so the subscription/OpenAI paths boot. DO NOT revert to "chat": CLI
+# 0.130 hard-fails config parse at this exact line and the codex agent
+# loop never starts (the live A2A blocker on prod-Reviewer/Researcher).
+wire_api = "responses"
 requires_openai_auth = false
 request_max_retries = 4
 stream_max_retries = 10
