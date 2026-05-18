@@ -72,7 +72,22 @@ jobs:
 
   publish:
     name: Build & push workspace-template-codex image
-    runs-on: ubuntu-latest
+    # Pin to the dedicated Linux publish runners (label "publish" →
+    # molecule-runner-publish-1/2). MUST NOT use `ubuntu-latest`: that
+    # label is also advertised by the Windows/WSL self-hosted runners
+    # (hongming-pc-runner-*, "C:\Users\qz154\.cache\act"), so the
+    # docker-build/push job landed non-deterministically on a Windows
+    # runner where `aws ecr get-login-password | docker login
+    # --password-stdin` fails with "protocol not available" (Docker
+    # credential store/helper unusable in that act/WSL context). This is
+    # placement-dependent, NOT a transient flake — runs 79610 (commit
+    # 2d54d260, task 127304, hongming-pc-runner-2) and 78342 (283f371,
+    # hongming-pc-runner-3) both failed there; Linux-runner builds
+    # (78300/78302) succeeded. Mirrors the org convention used by every
+    # molecule-core docker build/push job (publish-workspace-server-image
+    # .yml / publish-runtime.yml / publish-canvas-image.yml: `runs-on:
+    # publish`).
+    runs-on: publish
     timeout-minutes: 30
     needs: resolve-version
     steps:
