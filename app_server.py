@@ -26,6 +26,31 @@ Errors: any exception in the reader task fails ALL pending requests
 with that exception, prevents new request()s from succeeding, and
 surfaces the original cause in the close() return value. Designed so a
 mid-flight stdout pipe break doesn't silently hang request() callers.
+
+Failure modes the reader explicitly handles (see ``_read_loop`` and
+``_watch_child``):
+
+1. Reader raises (decode error → wraps as ConnectionError; cancelled →
+   propagates). Pending futures fail with the captured exception.
+2. Reader exits cleanly because stdout reached EOF — the child closed
+   the pipe (crashed, exited, or got buggy and stopped writing). We
+   treat EOF the same as an explicit error: ``_reader_exc`` is set and
+   pending futures are failed with ``ConnectionError("app-server stdout
+   closed (EOF) — child exited or stopped writing")``. Without this,
+   any pending ``request()`` would hang for the full request timeout
+   (10 min) even though the channel is irrecoverably dead.
+3. Child process exits (e.g. SIGKILL, segfault, OOM kill) while the
+   reader is mid-line. ``_watch_child`` awaits ``proc.wait()`` and on
+   completion fails all pending futures with ``ConnectionError("app-
+   server child exited with code …")``. Covers the case where the
+   reader is parked in ``readuntil`` and the OS reaps the child before
+   the pipe drains.
+
+Both paths converge: any request still in ``_pending`` when the
+channel goes dead receives a ConnectionError, never a silent
+infinite wait. Both paths set ``_reader_exc`` so subsequent
+``request()`` calls fail fast at the precondition check rather than
+queueing a future that will never resolve.
 """
 from __future__ import annotations
 
@@ -96,6 +121,7 @@ class AppServerProcess:
         self._write_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._watcher_task: asyncio.Task[None] | None = None
         self._closed = False
         self._reader_exc: BaseException | None = None
 
@@ -128,6 +154,9 @@ class AppServerProcess:
         )
         instance._stderr_task = asyncio.create_task(
             instance._stderr_loop(), name="codex-app-server-stderr"
+        )
+        instance._watcher_task = asyncio.create_task(
+            instance._watch_child(), name="codex-app-server-watcher"
         )
         return instance
 
@@ -168,6 +197,16 @@ class AppServerProcess:
         message = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             message["params"] = params
+
+        # Re-check after registering the future: the reader could have
+        # marked the channel dead between the precondition check and
+        # the future being added to _pending. Without this, a future
+        # added strictly after _mark_dead ran would not get failed.
+        if self._reader_exc is not None:
+            self._pending.pop(request_id, None)
+            raise ConnectionError(
+                f"app-server reader failed: {self._reader_exc!r}"
+            ) from self._reader_exc
 
         try:
             await self._write_message(message)
@@ -217,7 +256,11 @@ class AppServerProcess:
                 pass
 
         # Cancel reader tasks; they should exit on stdout EOF anyway.
-        for task in (self._reader_task, self._stderr_task):
+        # The watcher task drops out naturally once proc.wait() returns
+        # below, but cancelling it here is safe (and idempotent) — it
+        # avoids a stray pending task in pathological cases where
+        # SIGKILL doesn't actually reap the child.
+        for task in (self._reader_task, self._stderr_task, self._watcher_task):
             if task and not task.done():
                 task.cancel()
 
@@ -253,7 +296,26 @@ class AppServerProcess:
             await self._proc.stdin.drain()
 
     async def _read_loop(self) -> None:
-        """Drain stdout line-by-line, route messages by id."""
+        """Drain stdout line-by-line, route messages by id.
+
+        Three exit conditions, all of which mark the channel dead and
+        fail every pending request:
+
+        1. Exception during read / parse — capture, set ``_reader_exc``,
+           propagate to the task.
+        2. Cancellation (close() in progress) — re-raise without
+           touching pending state; ``close()`` handles those.
+        3. EOF on stdout (``async for`` completes normally) — the child
+           closed the pipe. Treat the SAME as a fatal exception: set
+           ``_reader_exc`` to a ConnectionError, fail pending futures.
+
+        (3) is the production wedge. Pre-fix the loop returned cleanly
+        on EOF, ``_reader_exc`` stayed None, and any future a caller
+        registered after EOF would wait the full request timeout (10
+        minutes) before timing out — looking exactly like the
+        ``message/send`` 60 s curl wedge with 0 bytes received that
+        prod-Reviewer/Researcher hit on the 2026-05-18 probe.
+        """
         assert self._proc.stdout is not None
         try:
             async for raw in self._proc.stdout:
@@ -269,13 +331,55 @@ class AppServerProcess:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            self._reader_exc = exc
-            # Fail all pending requests so callers don't hang on a dead pipe.
-            for fut in self._pending.values():
-                if not fut.done():
-                    fut.set_exception(exc)
-            self._pending.clear()
+            self._mark_dead(exc)
             raise
+        else:
+            # Normal exit = stdout reached EOF. Channel is dead even
+            # though no exception fired. Without this branch, pending
+            # requests would silently wait out the full request timeout.
+            self._mark_dead(
+                ConnectionError(
+                    "app-server stdout closed (EOF) — child exited or "
+                    "stopped writing"
+                )
+            )
+
+    async def _watch_child(self) -> None:
+        """Reap the child and fail pending requests if it exits.
+
+        ``_read_loop`` catches stdout EOF, but a child that segfaults /
+        is OOM-killed / SIGKILLed may have its stdout drained before
+        the reader notices, or the reader may be parked in
+        ``readuntil`` while ``wait()`` returns first. This watcher is
+        the second-chance fail-fast: any pending future not already
+        failed by the reader gets one here.
+        """
+        try:
+            rc = await self._proc.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("child wait() failed")
+            return
+        if self._closed:
+            return
+        # Reader may have already fired _mark_dead; this is idempotent.
+        self._mark_dead(
+            ConnectionError(f"app-server child exited with code {rc}")
+        )
+
+    def _mark_dead(self, exc: BaseException) -> None:
+        """Mark the channel dead and fail every pending future.
+
+        Idempotent. Calls after the first one update ``_reader_exc``
+        only if it was None — the first cause wins.
+        """
+        if self._reader_exc is None:
+            self._reader_exc = exc
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(exc)
+        self._pending.clear()
 
     async def _stderr_loop(self) -> None:
         """Forward app-server stderr to our logger at DEBUG."""

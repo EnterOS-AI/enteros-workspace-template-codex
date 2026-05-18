@@ -122,3 +122,89 @@ async def test_request_after_close_raises() -> None:
     await proc.close()
     with pytest.raises(ConnectionError):
         await proc.request("echo", {"text": "x"})
+
+
+@pytest.mark.asyncio
+async def test_eof_fails_pending_requests() -> None:
+    """Stdout EOF on a still-alive child must fail every pending request.
+
+    Regression for the 2026-05-18 prod-Reviewer/Researcher wedge: the
+    codex CLI closed its stdout pipe mid-conversation while the
+    process itself stayed alive (parked in epoll). Pre-fix
+    AppServerProcess._read_loop returned cleanly on EOF without
+    setting _reader_exc — any subsequent request() blocked on a future
+    that would never resolve until the 600 s request timeout. Post-fix
+    EOF sets _reader_exc and fails every pending future immediately.
+    """
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+
+        # Ask the mock to close stdout, then verify a subsequent
+        # request fails fast with ConnectionError (NOT a timeout).
+        await proc.request("close_stdout_after", {})
+
+        # Give the reader a moment to notice EOF.
+        await asyncio.sleep(0.1)
+
+        with pytest.raises(ConnectionError) as ei:
+            # 5s is plenty for the mark-dead path to trip; pre-fix
+            # this would wait the full default request timeout.
+            await proc.request("echo", {"text": "after-eof"}, timeout=5.0)
+        assert "EOF" in str(ei.value) or "stdout" in str(ei.value)
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_in_flight_request_fails_on_eof() -> None:
+    """A future already-pending when EOF arrives must fail, not hang."""
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+
+        # Issue a request whose response will never come because we'll
+        # close the stdout pipe in the SAME mock invocation. The mock's
+        # close_stdout_after acks first then closes, so the only way
+        # to test mid-flight failure is to issue a separate slow
+        # request alongside.
+        slow = asyncio.create_task(
+            proc.request("echo", {"text": "x", "delay_ms": 5000}, timeout=10.0)
+        )
+        # Yield long enough for the slow echo to be registered in
+        # _pending and written to stdin.
+        await asyncio.sleep(0.05)
+
+        # Close stdout — slow's pending future must fail.
+        await proc.request("close_stdout_after", {})
+
+        with pytest.raises(ConnectionError):
+            await slow
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_child_crash_fails_pending_requests() -> None:
+    """Child process exit must fail pending requests via the watcher.
+
+    Even if the reader missed EOF (parked in readuntil) the
+    _watch_child task awaits proc.wait() and on completion fails any
+    still-pending requests with ConnectionError. Covers OS-level
+    crashes (SIGKILL, segfault) that the reader-EOF path might race.
+    """
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+
+        # Ask the mock to crash. The ack arrives before the exit; the
+        # next request must fail fast.
+        await proc.request("crash_after", {})
+        # Give the child a moment to actually exit and the watcher to
+        # mark the channel dead.
+        await asyncio.sleep(0.3)
+
+        with pytest.raises(ConnectionError):
+            await proc.request("echo", {"text": "after-crash"}, timeout=5.0)
+    finally:
+        await proc.close()

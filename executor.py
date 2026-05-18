@@ -50,6 +50,28 @@ logger = logging.getLogger(__name__)
 # debug-time hangs.
 _TURN_TIMEOUT = 600.0
 
+# Inactivity watchdog: cap the gap BETWEEN events from codex. A healthy
+# turn emits frequent ``codex/event/*`` notifications (token deltas,
+# tool I/O, reasoning markers) — minutes-long gaps are themselves
+# evidence the channel is wedged, not work-in-progress. Smaller than
+# ``_TURN_TIMEOUT`` so a stuck child surfaces an error promptly to the
+# user instead of holding the lock for 10 minutes.
+#
+# Tuned from the production wedge:
+#   - Healthy fresh turn (gpt-5.5, no tool use): 2-3 s end-to-end.
+#   - Heavy tool-use turn: deltas every few seconds at most.
+#   - Wedged channel: zero events, zero rollout bytes for the full
+#     ``_TURN_TIMEOUT`` window. The watchdog catches that in 90 s
+#     instead of 600 s, and prints a diagnostic message.
+_TURN_INACTIVITY_TIMEOUT = 90.0
+
+# Bootstrap RPC timeouts. ``thread/start`` is an exchange that the
+# initialised child should answer in well under a second; capping it
+# means a child that wedges DURING initialise gets surfaced fast
+# instead of stalling the executor's first turn for 10 minutes.
+_INITIALIZE_TIMEOUT = 30.0
+_THREAD_START_TIMEOUT = 30.0
+
 
 @dataclass
 class _TurnState:
@@ -57,11 +79,19 @@ class _TurnState:
 
     Owned by the running ``_run_turn`` invocation; the notification
     subscriber appends to it under ``_turn_lock``.
+
+    ``activity`` is bumped on every notification the subscriber sees,
+    even ones we don't materially care about (debug-level events,
+    reasoning markers, tool I/O). It's the heartbeat the inactivity
+    watchdog reads — if the watchdog ticks and ``activity`` has not
+    advanced since the last tick, the channel is wedged and we surface
+    a diagnostic error.
     """
     deltas: list[str] = field(default_factory=list)
     completed: asyncio.Event = field(default_factory=asyncio.Event)
     error: Exception | None = None
     turn_id: str | None = None
+    activity: int = 0
 
 
 class CodexAppServerExecutor(AgentExecutor):
@@ -92,10 +122,17 @@ class CodexAppServerExecutor(AgentExecutor):
                 **os.environ,
             }
             self._app_server = await AppServerProcess.start(env=env)
-            await self._app_server.initialize(client_info={
-                "name": "molecule-runtime-codex",
-                "version": "0.1.0",
-            })
+            # Bounded handshake — a child wedged on initialize (rare but
+            # observed when stdio fights with a debug-attached pty)
+            # would otherwise stall the FIRST turn for the full
+            # _DEFAULT_REQUEST_TIMEOUT (10 minutes).
+            await asyncio.wait_for(
+                self._app_server.initialize(client_info={
+                    "name": "molecule-runtime-codex",
+                    "version": "0.1.0",
+                }),
+                timeout=_INITIALIZE_TIMEOUT,
+            )
             logger.info("codex app-server child initialized")
 
         if self._thread_id is None:
@@ -110,7 +147,9 @@ class CodexAppServerExecutor(AgentExecutor):
             params["approvalPolicy"] = "never"
             params["sandboxPolicy"] = {"mode": "workspace-write"}
 
-            resp = await self._app_server.request("thread/start", params)
+            resp = await self._app_server.request(
+                "thread/start", params, timeout=_THREAD_START_TIMEOUT,
+            )
             # Field name varies between the v2 JSON schema (threadId) and
             # the running binary 0.72.x (id). Accept either — verified
             # 2026-05-02 against codex-cli 0.72.0 which returns `id`.
@@ -301,6 +340,12 @@ class CodexAppServerExecutor(AgentExecutor):
             #   - task_complete       — turn finished cleanly
             #   - error               — fatal turn error
             # Reasoning / item / tool events are debug-logged.
+            #
+            # Activity bump: every notification (matched or unmatched)
+            # is the heartbeat for the inactivity watchdog. We bump
+            # before the early returns so even ignored bare-method
+            # events keep the channel "alive".
+            state.activity += 1
             if method == "error":
                 # Bare-method `error` notifications (parallel schema)
                 # carry the error payload under `params.error`. These
@@ -374,7 +419,7 @@ class CodexAppServerExecutor(AgentExecutor):
                 )
             self._current_turn_id = state.turn_id
 
-            await asyncio.wait_for(state.completed.wait(), timeout=_TURN_TIMEOUT)
+            await self._await_turn_completion(state)
         finally:
             unsubscribe()
             self._current_turn_id = None
@@ -382,6 +427,70 @@ class CodexAppServerExecutor(AgentExecutor):
         if state.error:
             raise state.error
         return "".join(state.deltas)
+
+    async def _await_turn_completion(self, state: _TurnState) -> None:
+        """Wait for turn completion with two stacked timeouts.
+
+        Stacked bounds:
+
+        - ``_TURN_INACTIVITY_TIMEOUT`` (90 s) — max gap between events.
+          A healthy turn emits ``codex/event/*`` notifications
+          continuously; a wedged channel emits zero. If the activity
+          counter does not advance for this long, we raise
+          ``asyncio.TimeoutError`` instead of waiting the full
+          ``_TURN_TIMEOUT``. This is the safety net for the 2026-05-18
+          production wedge: the executor would otherwise hold the
+          turn-lock for 10 minutes per stuck request, masking the
+          real channel failure.
+
+        - ``_TURN_TIMEOUT`` (600 s) — hard upper bound for total turn
+          duration even if events keep arriving. Preserves the
+          previous-generation bound for legitimately-long tool-use
+          turns (test runs, etc.).
+
+        The watchdog runs in 5 s ticks. Each tick:
+          1. If the completion event is set, return.
+          2. If the activity counter has not changed since the last
+             tick AND the inactivity window has elapsed, raise
+             TimeoutError.
+          3. If the total elapsed time exceeds ``_TURN_TIMEOUT``, raise
+             TimeoutError.
+        """
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        last_seen_activity = state.activity
+        last_activity_at = started_at
+        tick = 5.0
+
+        while True:
+            try:
+                await asyncio.wait_for(state.completed.wait(), timeout=tick)
+                return
+            except asyncio.TimeoutError:
+                pass
+
+            now = loop.time()
+            if state.activity != last_seen_activity:
+                last_seen_activity = state.activity
+                last_activity_at = now
+
+            if now - last_activity_at >= _TURN_INACTIVITY_TIMEOUT:
+                logger.warning(
+                    "codex turn %s wedged: no events for %.0fs "
+                    "(deltas=%d) — failing turn",
+                    state.turn_id,
+                    now - last_activity_at,
+                    len(state.deltas),
+                )
+                raise asyncio.TimeoutError(
+                    f"codex emitted no events for "
+                    f"{_TURN_INACTIVITY_TIMEOUT:.0f}s — channel wedged"
+                )
+            if now - started_at >= _TURN_TIMEOUT:
+                raise asyncio.TimeoutError(
+                    f"codex turn exceeded total budget "
+                    f"{_TURN_TIMEOUT:.0f}s"
+                )
 
     async def _reset_app_server(self) -> None:
         """Tear down + clear cached child. Idempotent."""

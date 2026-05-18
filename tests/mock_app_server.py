@@ -8,11 +8,26 @@ This stands in for the real codex binary so tests don't depend on a
 specific codex-cli version installed on the runner. Keep it dumb — any
 behavior the executor relies on must be tested against the real
 binary in an integration test, not here.
+
+Two failure modes are exposed for testing the reader-lifecycle
+hardening (added 2026-05-18 alongside the prod-Reviewer/Researcher
+wedge fix):
+
+- ``close_stdout_after`` request: the mock answers normally, then
+  closes its stdout file descriptor without exiting. This reproduces
+  the codex CLI behavior of closing the channel mid-conversation
+  while the process itself stays alive — the case the reader-EOF
+  detection path needs to catch.
+
+- ``crash_after`` request: the mock answers normally, then calls
+  ``os._exit(1)`` shortly after. Reproduces a child that segfaults /
+  is OOM-killed mid-turn — the case the child-watcher path catches.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 
 
@@ -84,6 +99,48 @@ async def _handle(msg: dict) -> None:
             "result": {"emitted": count},
         })
         return
+
+    if method == "close_stdout_after":
+        # Ack the request, then close stdout without exiting. The
+        # reader sees EOF; the child stays alive (so wait4 does NOT
+        # return). Exercises the EOF path of _read_loop.
+        #
+        # We close the underlying file descriptor (FD 1), not just the
+        # Python wrapper — closing sys.stdout only closes the Python
+        # buffer; the OS pipe needs ``os.close(1)`` to actually send
+        # EOF to the parent's reader.
+        _write({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"closed": True},
+        })
+        sys.stdout.flush()
+        try:
+            os.close(1)
+        except Exception:
+            pass
+        # Keep stdin draining so the process doesn't crash on next
+        # read — we want EOF on stdout WITHOUT the watcher firing.
+        try:
+            while True:
+                await asyncio.sleep(60)
+        except Exception:
+            return
+        return
+
+    if method == "crash_after":
+        # Ack, then exit non-zero a moment later. Exercises the
+        # _watch_child path: pending requests must fail when the
+        # child reaps, regardless of whether the reader noticed
+        # stdout EOF first.
+        _write({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"crashing": True},
+        })
+        sys.stdout.flush()
+        await asyncio.sleep(0.05)
+        os._exit(1)
 
     # Method not found.
     _write({

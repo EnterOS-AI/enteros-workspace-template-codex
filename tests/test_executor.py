@@ -4,10 +4,15 @@ We don't stand up a real codex app-server — those tests live in
 test_app_server.py which validates the JSON-RPC plumbing against a
 mock binary. Here we focus on the protocol-level behavior of
 ``_run_turn``: thread bootstrap, notification accumulation, completion
-detection, error surfacing, mid-turn serialization.
+detection, error surfacing, mid-turn serialization, and (the recent
+addition) the no-deadlock guarantees when the channel goes wedged.
 
 The fake AppServerProcess records every request sent and exposes a
-helper to drive notifications + responses on demand.
+helper to drive notifications + responses on demand. It deliberately
+mirrors the JSON-RPC notification shape codex 0.72+ emits in
+production (``method = "codex/event/<type>"`` with the payload under
+``params.msg``), not the bare-method legacy form, so test failures
+catch the same protocol bugs production hits.
 """
 from __future__ import annotations
 
@@ -25,7 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 pytest.importorskip("a2a.helpers")
 pytest.importorskip("molecule_runtime.adapters.base")
 
-from executor import CodexAppServerExecutor  # noqa: E402
+from executor import (  # noqa: E402
+    CodexAppServerExecutor,
+    _TURN_INACTIVITY_TIMEOUT,
+)
 from molecule_runtime.adapters.base import AdapterConfig  # noqa: E402
 
 
@@ -47,12 +55,24 @@ class FakeAppServer:
         self.thread_start_response: dict | None = None
         self.turn_start_responses: list[dict] = []
         self.turn_start_raises: Exception | None = None
+        # When set, request() raises this on the Nth call (1-indexed).
+        # Lets a test simulate the channel going dead between turns.
+        self.fail_request_n: int | None = None
+        self.fail_request_exc: Exception | None = None
+        self._request_count = 0
 
     async def initialize(self, *, client_info: dict) -> dict:
         return {"userAgent": "fake/0.0"}
 
     async def request(self, method: str, params: dict | None = None, *, timeout: float | None = None) -> dict:
+        self._request_count += 1
         self.requests.append((method, params or {}))
+        if (
+            self.fail_request_n is not None
+            and self._request_count >= self.fail_request_n
+            and self.fail_request_exc is not None
+        ):
+            raise self.fail_request_exc
         if method == "thread/start":
             if self.thread_start_response is not None:
                 return self.thread_start_response
@@ -72,7 +92,7 @@ class FakeAppServer:
             return {}
         raise AssertionError(f"unexpected method: {method}")
 
-    def subscribe(self, callback) -> "asyncio.coroutines.Coroutine":
+    def subscribe(self, callback):
         self._subscribers.append(callback)
 
         def unsubscribe() -> None:
@@ -88,18 +108,52 @@ class FakeAppServer:
         return 0
 
     # --- test helpers ---------------------------------------------------
+    def push_delta(self, text: str) -> None:
+        """Push a streamed agent_message_delta (codex 0.72+ shape)."""
+        self.push(
+            "codex/event/agent_message_delta",
+            {"msg": {"type": "agent_message_delta", "delta": text}},
+        )
+
+    def push_task_complete(self, last_message: str | None = None) -> None:
+        """Push the canonical end-of-turn event (codex 0.72+ shape)."""
+        msg: dict = {"type": "task_complete"}
+        if last_message is not None:
+            msg["last_agent_message"] = last_message
+        self.push("codex/event/task_complete", {"msg": msg})
+
+    def push_event_error(self, message: str) -> None:
+        """Push a fatal error notification under the codex/event envelope."""
+        self.push(
+            "codex/event/error",
+            {"msg": {"type": "error", "message": message}},
+        )
+
     def push(self, method: str, params: dict | None = None) -> None:
         """Synchronously deliver a notification to all subscribers."""
         for cb in list(self._subscribers):
             cb(method, params or {})
 
 
-def _make_executor(fake: FakeAppServer, *, model: str = "gpt-5", system_prompt: str = "be helpful") -> CodexAppServerExecutor:
+def _make_executor(fake: FakeAppServer, *, model: str = "gpt-5.5", system_prompt: str = "be helpful") -> CodexAppServerExecutor:
     cfg = AdapterConfig(model=model, system_prompt=system_prompt)
     ex = CodexAppServerExecutor(cfg)
     # Pre-inject the fake so _ensure_thread skips spawning codex.
     ex._app_server = fake  # type: ignore[assignment]
     return ex
+
+
+async def _wait_for_method(fake: FakeAppServer, method: str, *, after_count: int = 0) -> None:
+    """Yield until ``method`` has been recorded at least ``after_count + 1`` times."""
+    for _ in range(500):
+        seen = sum(1 for m, _ in fake.requests if m == method)
+        if seen > after_count:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(
+        f"never saw {after_count + 1} call(s) to {method}; "
+        f"requests so far: {[m for m, _ in fake.requests]}"
+    )
 
 
 @pytest.mark.asyncio
@@ -108,14 +162,10 @@ async def test_run_turn_starts_thread_and_returns_assembled_deltas() -> None:
     ex = _make_executor(fake)
 
     async def driver() -> None:
-        # Wait until turn/start is recorded, then push deltas + completion.
-        for _ in range(50):
-            if any(m == "turn/start" for m, _ in fake.requests):
-                break
-            await asyncio.sleep(0.01)
-        fake.push("agent_message_delta", {"delta": "hello "})
-        fake.push("agent_message_delta", {"delta": "world"})
-        fake.push("turn/completed", {"turnId": "tu_1"})
+        await _wait_for_method(fake, "turn/start")
+        fake.push_delta("hello ")
+        fake.push_delta("world")
+        fake.push_task_complete()
 
     driver_task = asyncio.create_task(driver())
     text = await ex._run_turn("hi")
@@ -129,29 +179,38 @@ async def test_run_turn_starts_thread_and_returns_assembled_deltas() -> None:
 
 @pytest.mark.asyncio
 async def test_run_turn_reuses_thread_on_second_call() -> None:
+    """The regression that wedged prod-Reviewer/Researcher 2026-05-18.
+
+    Pre-fix the second ``_run_turn`` returned (FakeAppServer side it
+    worked) but the real app-server's reader loop had exited on stdout
+    EOF without failing pending requests — so the second
+    ``state.completed.wait()`` would block until ``_TURN_TIMEOUT``.
+
+    This unit exercises the executor's protocol contract (two turns
+    reuse the thread, both assemble their deltas), and the live
+    failure mode of the same multi-turn shape is covered in
+    test_app_server.py::test_eof_fails_pending_requests.
+    """
     fake = FakeAppServer()
     ex = _make_executor(fake)
 
-    async def drive_one(text: str, turn_id: str) -> None:
-        for _ in range(50):
-            count = sum(1 for m, _ in fake.requests if m == "turn/start")
-            if count >= int(turn_id.split("_")[1]):
-                break
-            await asyncio.sleep(0.01)
-        fake.push("agent_message_delta", {"delta": text})
-        fake.push("turn/completed", {"turnId": turn_id})
+    async def drive_one(text: str, turn_index: int) -> None:
+        await _wait_for_method(fake, "turn/start", after_count=turn_index)
+        fake.push_delta(text)
+        fake.push_task_complete()
 
-    t1 = asyncio.create_task(drive_one("first", "tu_1"))
+    t1 = asyncio.create_task(drive_one("first", 0))
     text1 = await ex._run_turn("ping")
     await t1
 
-    t2 = asyncio.create_task(drive_one("second", "tu_2"))
+    t2 = asyncio.create_task(drive_one("second", 1))
     text2 = await ex._run_turn("pong")
     await t2
 
     assert text1 == "first"
     assert text2 == "second"
-    # thread/start should fire EXACTLY once across both turns.
+    # thread/start should fire EXACTLY once across both turns — turn 2
+    # MUST reuse the thread, not re-bootstrap.
     thread_starts = sum(1 for m, _ in fake.requests if m == "thread/start")
     assert thread_starts == 1
 
@@ -162,11 +221,8 @@ async def test_run_turn_surfaces_error_notification() -> None:
     ex = _make_executor(fake)
 
     async def driver() -> None:
-        for _ in range(50):
-            if any(m == "turn/start" for m, _ in fake.requests):
-                break
-            await asyncio.sleep(0.01)
-        fake.push("error_notification", {"message": "model rate limited"})
+        await _wait_for_method(fake, "turn/start")
+        fake.push_event_error("model rate limited")
 
     driver_task = asyncio.create_task(driver())
     with pytest.raises(RuntimeError, match="rate limited"):
@@ -180,11 +236,8 @@ async def test_thread_start_passes_config() -> None:
     ex = _make_executor(fake, model="o4-mini", system_prompt="custom prompt")
 
     async def driver() -> None:
-        for _ in range(50):
-            if any(m == "turn/start" for m, _ in fake.requests):
-                break
-            await asyncio.sleep(0.01)
-        fake.push("turn/completed", {"turnId": "tu_1"})
+        await _wait_for_method(fake, "turn/start")
+        fake.push_task_complete()
 
     driver_task = asyncio.create_task(driver())
     await ex._run_turn("hi")
@@ -212,15 +265,10 @@ async def test_turn_lock_serializes_concurrent_executes() -> None:
         # request log. Because of the lock, turn idx 2 won't start
         # until turn idx 1 is acked.
         async def driver() -> None:
-            target_count = idx + 1
-            for _ in range(200):
-                count = sum(1 for m, _ in fake.requests if m == "turn/start")
-                if count >= target_count:
-                    starts.append(idx)
-                    break
-                await asyncio.sleep(0.005)
-            fake.push("agent_message_delta", {"delta": f"r{idx}"})
-            fake.push("turn/completed", {"turnId": f"tu_{idx + 1}"})
+            await _wait_for_method(fake, "turn/start", after_count=idx)
+            starts.append(idx)
+            fake.push_delta(f"r{idx}")
+            fake.push_task_complete()
             completes.append(idx)
 
         driver_task = asyncio.create_task(driver())
@@ -243,3 +291,156 @@ async def test_turn_lock_serializes_concurrent_executes() -> None:
     # Strict ordering check: between any two `starts` events, there
     # must be a corresponding `completes` event.
     assert starts[0] in completes[:1]
+
+
+@pytest.mark.asyncio
+async def test_inactivity_watchdog_surfaces_error_on_silent_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 2026-05-18 wedge: codex stops emitting events mid-turn.
+
+    Pre-fix, ``_run_turn`` would block on ``state.completed.wait()``
+    for the full ``_TURN_TIMEOUT`` (10 minutes) when codex stopped
+    sending events. Post-fix, the inactivity watchdog raises
+    TimeoutError after ``_TURN_INACTIVITY_TIMEOUT`` seconds.
+
+    We monkeypatch the watchdog timeout to a fraction of a second so
+    the test runs in well under a second.
+    """
+    import executor as exec_mod
+
+    monkeypatch.setattr(exec_mod, "_TURN_INACTIVITY_TIMEOUT", 0.3)
+
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        # Emit ONE delta to confirm activity worked, then go silent.
+        fake.push_delta("hello, ")
+        # No task_complete, no further events — wedge.
+
+    driver_task = asyncio.create_task(driver())
+    with pytest.raises(asyncio.TimeoutError, match="channel wedged"):
+        await ex._run_turn("hi")
+    await driver_task
+
+    # Lock must be released so the next caller doesn't inherit the wedge.
+    assert not ex._turn_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_inactivity_watchdog_resets_on_each_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow-but-alive channel must NOT trip the watchdog.
+
+    The inactivity watchdog fires only on gaps BETWEEN events. As long
+    as codex keeps emitting (deltas, reasoning, tool I/O — anything
+    that bumps ``state.activity``), the turn runs to its natural end
+    even if total time exceeds _TURN_INACTIVITY_TIMEOUT.
+    """
+    import executor as exec_mod
+
+    monkeypatch.setattr(exec_mod, "_TURN_INACTIVITY_TIMEOUT", 0.4)
+
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        # Drip-feed events under the 0.4s inactivity bound.
+        for chunk in ("a", "b", "c", "d", "e"):
+            fake.push_delta(chunk)
+            await asyncio.sleep(0.15)
+        fake.push_task_complete()
+
+    driver_task = asyncio.create_task(driver())
+    text = await ex._run_turn("hi")
+    await driver_task
+
+    assert text == "abcde"
+
+
+@pytest.mark.asyncio
+async def test_second_turn_after_channel_dies_surfaces_error_promptly() -> None:
+    """Second turn must NOT hang when the channel went dead after turn 1.
+
+    Mirrors the 2026-05-18 prod-Reviewer/Researcher wedge: first turn
+    completes, then the codex CLI's stdout closes (crash / EOF /
+    silent). Pre-fix turn 2 hung on state.completed.wait() for 10
+    minutes. Post-fix the executor surfaces the ConnectionError that
+    bubbles from AppServerProcess.request().
+    """
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    # Turn 1: succeeds cleanly.
+    async def drive_one() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push_delta("ok")
+        fake.push_task_complete()
+
+    t1 = asyncio.create_task(drive_one())
+    text1 = await ex._run_turn("hi 1")
+    await t1
+    assert text1 == "ok"
+
+    # Turn 2: app-server now dead. Any new request() raises
+    # ConnectionError (the same exception AppServerProcess raises when
+    # _reader_exc is set by EOF detection).
+    fake.fail_request_n = len(fake.requests) + 1
+    fake.fail_request_exc = ConnectionError(
+        "app-server stdout closed (EOF) — child exited or stopped writing"
+    )
+
+    with pytest.raises(ConnectionError, match="stdout closed"):
+        await ex._run_turn("hi 2")
+
+    # Lock must be released so the NEXT caller doesn't inherit the wedge.
+    assert not ex._turn_lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_thread_start_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_ensure_thread() must NOT block indefinitely on a wedged child.
+
+    Pre-fix a child wedged during initialize / thread-start would hang
+    the executor's first turn for ``_DEFAULT_REQUEST_TIMEOUT`` (10 min).
+    Post-fix we cap initialize and thread/start so the failure surfaces
+    fast.
+
+    The fake here enforces the ``timeout=`` kwarg the same way
+    AppServerProcess.request does — wrapping the inner sleep in
+    asyncio.wait_for — so the test exercises the real contract the
+    executor relies on.
+    """
+    import executor as exec_mod
+
+    # Drop the bootstrap timeouts to make the test run in well under a
+    # second.
+    monkeypatch.setattr(exec_mod, "_THREAD_START_TIMEOUT", 0.2)
+    monkeypatch.setattr(exec_mod, "_INITIALIZE_TIMEOUT", 0.2)
+
+    class WedgedAppServer(FakeAppServer):
+        async def request(self, method: str, params: dict | None = None, *, timeout: float | None = None) -> dict:
+            self.requests.append((method, params or {}))
+            if method == "thread/start":
+                # Mimic AppServerProcess.request: enforce caller-passed
+                # timeout via wait_for. A real wedged child would have
+                # its request future never resolve; the wait_for is
+                # what surfaces the TimeoutError.
+                async def _never() -> dict:
+                    await asyncio.sleep(10.0)
+                    return {"thread": {"id": "never"}}
+                return await asyncio.wait_for(
+                    _never(),
+                    timeout=timeout if timeout is not None else 10.0,
+                )
+            return await super().request(method, params, timeout=timeout)
+
+    fake = WedgedAppServer()
+    ex = _make_executor(fake)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await ex._run_turn("hi")
