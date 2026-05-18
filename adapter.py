@@ -21,11 +21,14 @@ to wait on at start time.
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from pathlib import Path
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
+
+logger = logging.getLogger(__name__)
 
 
 class CodexAdapter(BaseAdapter):
@@ -60,15 +63,41 @@ class CodexAdapter(BaseAdapter):
                     "Empty = codex default (gpt-5.5)."
                 ),
             },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional codex provider id from the `providers:` "
+                    "registry in config.yaml (e.g. 'openai-subscription', "
+                    "'openai-api', 'minimax-token-plan'). Empty = "
+                    "auto-resolve from model + env credentials."
+                ),
+            },
         }
 
     async def setup(self, config: AdapterConfig) -> None:
-        """Verify the codex binary is on PATH and OPENAI_API_KEY is set.
+        """Verify the codex binary is on PATH and a credential is set, then
+        render ``~/.codex/config.toml`` from the providers registry.
 
         We do NOT spawn the app-server here — that happens lazily on
         the first turn inside the executor. Failing fast at setup
         time with a clear message beats a confusing ``FileNotFoundError``
         from the executor's first ``asyncio.create_subprocess_exec``.
+
+        Provider resolution (see ``provider_config.resolve_provider``):
+          1. Explicit ``provider`` field in ``runtime_config`` /
+             ``MODEL_PROVIDER`` env wins.
+          2. Else, if any ``chatgpt_subscription`` provider's auth_env
+             is set (``CODEX_AUTH_JSON`` / ``CODEX_CHATGPT_AUTH_JSON``),
+             pick it — preserves the verified prod behavior where the
+             subscription beats a co-set vendor key.
+          3. Else, model-prefix / alias match against the registry.
+          4. Else, first credential-satisfied entry, with the registry's
+             first entry as the final fallback.
+
+        The resolved provider is then rendered to ``~/.codex/config.toml``:
+        built-in modes (subscription, openai_api) emit NO override (the
+        CLI's native OpenAI/Responses provider handles them); compat
+        providers emit ``[model_providers.<slug>]`` + ``model_provider``.
         """
         if not shutil.which("codex"):
             raise RuntimeError(
@@ -109,12 +138,85 @@ class CodexAdapter(BaseAdapter):
             raise RuntimeError(
                 "No codex credential found. Codex needs exactly one "
                 "of: OPENAI_API_KEY (direct OpenAI), MINIMAX_API_KEY "
-                "(MiniMax chat-wire route), or an injected "
+                "(MiniMax token-plan codex route), or an injected "
                 "ChatGPT/Codex-subscription auth.json at "
-                f"{auth_json} (set CODEX_AUTH_JSON — the Infisical "
-                "/shared/codex-oauth credential — for a single-runner "
+                f"{auth_json} (set CODEX_AUTH_JSON for a single-runner "
                 "workspace). Configure via the canvas Config tab."
             )
+
+        # --- Provider resolution + config.toml rendering ---
+        # Pull the picked model + (optional) explicit provider from
+        # runtime_config (the canvas Config tab writes here on Save).
+        rc = getattr(config, "runtime_config", None)
+        if isinstance(rc, dict):
+            yaml_model = rc.get("model") or ""
+            yaml_provider = rc.get("provider") or ""
+        else:
+            yaml_model = getattr(rc, "model", None) or getattr(config, "model", "") or ""
+            yaml_provider = getattr(rc, "provider", None) or ""
+
+        # MODEL_PROVIDER env from the persona-env layer (if any) wins
+        # over YAML when set — mirrors the claude-code template's
+        # _resolve_model_and_provider_from_env shape.
+        env_provider = (os.environ.get("MODEL_PROVIDER") or "").strip()
+        explicit_provider = env_provider or yaml_provider or None
+
+        try:
+            from provider_config import (
+                load_providers, resolve_provider, write_config_toml,
+            )
+        except ImportError as exc:
+            # Defensive: fall back to the legacy shell-script path
+            # below if the module can't be imported (e.g. a partial
+            # install). The credential preflight above has already
+            # gated; codex will boot off OPENAI_API_KEY or auth.json
+            # using the CLI defaults.
+            logger.warning(
+                "codex: provider_config import failed (%s); "
+                "skipping registry-driven config.toml render",
+                exc,
+            )
+            return
+
+        providers = load_providers(
+            workspace_config_path=getattr(config, "config_path", "") or "",
+        )
+        try:
+            picked = resolve_provider(
+                yaml_model, providers,
+                explicit_provider=explicit_provider,
+            )
+        except ValueError:
+            # Re-raise with the actionable message intact — silent
+            # fallback to providers[0] when the operator picked an
+            # unknown name would route them through the wrong
+            # base_url + env key (the analog #180 in claude-code).
+            raise
+
+        # Render + write config.toml. For built-in OpenAI auth modes
+        # (subscription, openai_api) this writes NOTHING and clears
+        # any stale auto-generated override — exactly the verified
+        # device-logged codex-0.130 shape that the prod-Reviewer /
+        # prod-Researcher path requires.
+        codex_home = os.environ.get("CODEX_HOME") or os.path.join(
+            os.path.expanduser("~"), ".codex"
+        )
+        try:
+            written = write_config_toml(
+                picked, model=yaml_model or None, codex_home=codex_home,
+            )
+        except ValueError as exc:
+            # Misconfigured registry entry (missing base_url / vendor
+            # env). Fail closed so the operator sees the YAML defect.
+            raise RuntimeError(
+                f"codex provider registry: {exc}"
+            ) from exc
+
+        logger.info(
+            "codex adapter: provider=%s auth_mode=%s wrote=%s",
+            picked["name"], picked["auth_mode"],
+            str(written) if written else "<no override>",
+        )
 
     async def create_executor(self, config: AdapterConfig):
         from executor import CodexAppServerExecutor

@@ -68,16 +68,55 @@ echo "[start.sh] codex installed: ${CODEX_VERSION}"
 install -d -o agent -g agent /home/agent/.codex
 install -d -o agent -g agent /home/agent/.codex/sessions
 
-# Generate the MiniMax provider config.toml when MINIMAX_API_KEY is
-# present. No-op when the operator is using OpenAI direct (the env
-# the codex CLI checks defaults to OPENAI_API_KEY in that path).
-# Source: https://platform.minimax.io/docs/token-plan/codex-cli
-if [ -f /usr/local/bin/codex_minimax_config.sh ]; then
-  HOME=/home/agent CODEX_HOME=/home/agent/.codex \
-    bash /usr/local/bin/codex_minimax_config.sh
-elif [ -f /app/codex_minimax_config.sh ]; then
-  HOME=/home/agent CODEX_HOME=/home/agent/.codex \
-    bash /app/codex_minimax_config.sh
+# Render ~/.codex/config.toml from the providers registry. Replaces
+# the legacy codex_minimax_config.sh's hardcoded MiniMax path: the
+# python helper reads `providers:` from config.yaml, resolves to the
+# right provider against the current env (subscription preferred when
+# CODEX_AUTH_JSON is set, then explicit model-prefix match, then
+# credential auto-detect), and writes the model_provider block — or
+# writes NOTHING when the picked provider is one of codex's built-in
+# OpenAI auth modes (the verified prod shape for the subscription /
+# OPENAI_API_KEY paths).
+#
+# The legacy codex_minimax_config.sh is kept as a compat fallback for
+# this one release so external ops scripts and the existing test
+# fixtures (which exec the .sh directly) keep working. Once those
+# downstream consumers cut over, the .sh becomes purely historical.
+PROVIDER_RENDER=""
+for cand in /opt/adapter/render_provider_toml.py /usr/local/bin/render_provider_toml.py /app/render_provider_toml.py; do
+  if [ -f "$cand" ]; then PROVIDER_RENDER="$cand"; break; fi
+done
+if [ -n "$PROVIDER_RENDER" ]; then
+  # Prefer the runtime venv python (carries pyyaml). Falls back to
+  # whichever python3 is on PATH; provider_config gracefully degrades
+  # to its builtin registry if pyyaml is unavailable.
+  PROVIDER_PY=""
+  for cand in /opt/molecule-venv/bin/python3 /opt/molecule-venv/bin/python python3 python; do
+    if command -v "$cand" >/dev/null 2>&1; then PROVIDER_PY="$cand"; break; fi
+  done
+  if [ -n "$PROVIDER_PY" ]; then
+    HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+      WORKSPACE_CONFIG_PATH="${WORKSPACE_CONFIG_PATH:-/configs}" \
+      "$PROVIDER_PY" "$PROVIDER_RENDER" || \
+      echo "[start.sh] WARN: render_provider_toml.py exited non-zero; falling back to legacy shell helper" >&2
+  else
+    echo "[start.sh] WARN: no python3 found; falling back to legacy codex_minimax_config.sh" >&2
+    PROVIDER_RENDER=""
+  fi
+fi
+
+# Legacy fallback path — kept so existing fixtures + ops scripts that
+# call the .sh directly continue to work. When PROVIDER_RENDER ran
+# successfully above this is a no-op (no MINIMAX_API_KEY or the
+# python wrote the right config.toml already).
+if [ -z "$PROVIDER_RENDER" ]; then
+  if [ -f /usr/local/bin/codex_minimax_config.sh ]; then
+    HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+      bash /usr/local/bin/codex_minimax_config.sh
+  elif [ -f /app/codex_minimax_config.sh ]; then
+    HOME=/home/agent CODEX_HOME=/home/agent/.codex \
+      bash /app/codex_minimax_config.sh
+  fi
 fi
 
 # Append the molecule A2A MCP server block — gives the codex agent
