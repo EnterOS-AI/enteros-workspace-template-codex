@@ -180,7 +180,7 @@ jobs:
   #       MCP subprocess does before calling list_peers.
   t4-conformance:
     name: T4 tier-4 conformance (live)
-    runs-on: ubuntu-latest
+    runs-on: docker-host
     timeout-minutes: 15
     needs: validate-static
     if: github.event.pull_request.head.repo.fork != true
