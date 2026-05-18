@@ -196,6 +196,72 @@ def test_codex_cli_pinned_to_0130_exact() -> None:
     assert "@openai/codex@^0.72" not in df
 
 
+# --- Group 4: wire_api regression guard (internal#513) ---------------------
+# codex CLI 0.130 (baked by #219) REMOVED the `chat` WireApi variant.
+# It hard-fails config.toml parsing on `wire_api = "chat"` at the line
+# that holds it, BEFORE auth.json / OPENAI_API_KEY is read — so the
+# codex agent loop never starts and A2A stays unanswered (the live
+# prod-Reviewer / prod-Researcher blocker filed as internal#513). These
+# tests fail closed if anyone reverts the value, in source OR in the
+# config.toml the boot script actually generates.
+
+_CODEX_MINIMAX_SH = _ROOT / "codex_minimax_config.sh"
+
+
+def test_minimax_config_source_has_no_chat_wire_api() -> None:
+    """Static guard: the generator script must never hard-write
+    `wire_api = "chat"` — CLI 0.130 rejects it unconditionally."""
+    src = _CODEX_MINIMAX_SH.read_text()
+    # Only assignments matter; the header note quotes "chat" while
+    # explaining the removal, so match the TOML assignment form.
+    import re
+    assigns = re.findall(r'(?m)^\s*wire_api\s*=\s*"([^"]+)"', src)
+    assert assigns, "expected a wire_api assignment in the heredoc"
+    for val in assigns:
+        assert val != "chat", (
+            "codex_minimax_config.sh writes wire_api = \"chat\"; CLI "
+            "0.130 hard-fails config parse on it (internal#513). Use "
+            '"responses".'
+        )
+        assert val == "responses", (
+            f'wire_api = "{val}" is not a CLI-0.130 parse-valid value; '
+            'only "responses" remains after the chat-wire removal.'
+        )
+
+
+def test_generated_config_toml_wire_api_is_responses(tmp_path) -> None:
+    """End-to-end guard: actually run codex_minimax_config.sh with a
+    MiniMax key set and assert the GENERATED config.toml carries a
+    CLI-0.130-valid wire_api (no `chat`, exactly `responses`). This is
+    the line the live error pointed at (config.toml:11:12)."""
+    codex_home = tmp_path / ".codex"
+    env = {
+        **os.environ,
+        "MINIMAX_API_KEY": "sk-test-regression-guard",
+        "CODEX_HOME": str(codex_home),
+        "HOME": str(tmp_path),
+        # /configs patch is best-effort + skipped when absent; point it
+        # at a non-existent dir so the script's guarded branch no-ops.
+        "WORKSPACE_CONFIG_PATH": str(tmp_path / "no-configs"),
+    }
+    subprocess.run(
+        ["bash", str(_CODEX_MINIMAX_SH)],
+        env=env, check=True, capture_output=True, text=True,
+    )
+    body = (codex_home / "config.toml").read_text()
+    import re
+    assigns = re.findall(r'(?m)^\s*wire_api\s*=\s*"([^"]+)"', body)
+    assert assigns, f"no wire_api in generated config.toml:\n{body}"
+    assert "chat" not in assigns, (
+        "generated config.toml still has wire_api = \"chat\" — codex "
+        f"CLI 0.130 will hard-fail parse (internal#513).\n{body}"
+    )
+    assert assigns == ["responses"], (
+        f"generated wire_api {assigns} != ['responses'] — only "
+        '"responses" is parse-valid on CLI 0.130.'
+    )
+
+
 def _run_probe(env: dict) -> Path:
     home = Path(env["__TMP_HOME"])
     script = _MODE_C_PROBE.replace("/home/agent", str(home))
