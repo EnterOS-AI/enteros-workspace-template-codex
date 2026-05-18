@@ -42,8 +42,48 @@
 #
 # When MINIMAX_API_KEY is missing this is a no-op so OpenAI-direct
 # users see no behavior change.
+#
+# SUBSCRIPTION TAKES PRECEDENCE OVER THE MINIMAX ALT (internal#513):
+# When the ChatGPT/Codex subscription is injected (CODEX_AUTH_JSON or
+# its CODEX_CHATGPT_AUTH_JSON backward-compat alias is set — the prod
+# Reviewer/Researcher path, #219) this script MUST NOT write the
+# minimax provider block, even if MINIMAX_API_KEY also happens to be
+# present on the same workspace. Codex 0.130's built-in OpenAI
+# provider IS the subscription provider: with auth.json
+# (auth_mode:"chatgpt") and NO `model_provider` override in
+# config.toml, codex routes to the OpenAI/Codex Responses backend
+# natively (verified: a working device-logged codex-0.130 config.toml
+# carries NO model_provider / model / base_url / wire_api block at
+# all — the model is selected via thread/start, which the adapter
+# passes as gpt-5.5 from config.yaml). If we instead emit the minimax
+# block here, config.toml pins model_provider=minimax +
+# base_url=https://api.minimax.io/v1 while start.sh's mode-C only
+# appends auth keys (it does NOT rewrite the provider) — so codex
+# authenticates off the subscription but POSTs to
+# https://api.minimax.io/v1/responses, which MiniMax does not serve
+# → "unexpected status 404 Not Found ... url:
+# https://api.minimax.io/v1/responses" on EVERY turn. That is the
+# exact live A2A blocker observed on prod-Reviewer
+# (469b511b-5794-4847-9da0-ddc0a9e6bc24) and prod-Researcher
+# (4dfbd391-b541-437d-852c-88d80c3ffadc). The PR#10 wire_api flip was
+# necessary (config parses) but NOT sufficient (still wrong provider).
+# The minimax leg's own Chat-vs-Responses incompatibility on CLI 0.130
+# stays tracked separately as molecule-ai/internal#514 and is NOT
+# regressed here — it just no longer shadows the prod subscription
+# path. Skip is a true no-op (identical to the no-MINIMAX_API_KEY
+# branch): config.toml is left without a provider override so codex
+# uses its built-in subscription provider.
 
 set -euo pipefail
+
+if [ -n "${CODEX_AUTH_JSON:-${CODEX_CHATGPT_AUTH_JSON:-}}" ]; then
+  echo "[codex-minimax] ChatGPT/Codex subscription present (CODEX_AUTH_JSON" \
+    "/ alias) — skipping minimax provider block so codex uses its" \
+    "built-in subscription provider (Responses API, model via" \
+    "thread/start). The MiniMax alt is subordinate to the" \
+    "subscription (internal#513; MiniMax-Responses gap = internal#514)."
+  return 0 2>/dev/null || exit 0
+fi
 
 if [ -z "${MINIMAX_API_KEY:-}" ]; then
   echo "[codex-minimax] no MINIMAX_API_KEY — codex will use its default (OpenAI) provider"

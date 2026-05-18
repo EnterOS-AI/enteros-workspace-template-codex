@@ -262,6 +262,125 @@ def test_generated_config_toml_wire_api_is_responses(tmp_path) -> None:
     )
 
 
+# --- Group 5: subscription provider precedence (internal#513) --------------
+# The PR#10 wire_api flip made config.toml PARSE on CLI 0.130, but the
+# prod Reviewer/Researcher workspaces have BOTH CODEX_AUTH_JSON (the
+# #219 subscription) AND MINIMAX_API_KEY set. codex_minimax_config.sh
+# (cat >) was unconditionally writing model_provider=minimax +
+# base_url=https://api.minimax.io/v1, and start.sh's mode-C only
+# appends auth keys (it does NOT rewrite the provider). Net: codex
+# authed off the subscription but POSTed to
+# https://api.minimax.io/v1/responses → live 404 on every A2A turn.
+# These guards fail closed if the minimax block is ever emitted while
+# a subscription credential is present.
+
+def _gen_config(tmp_path: Path, env_extra: dict) -> str:
+    """Run the real codex_minimax_config.sh and return config.toml
+    text (empty string if the script wrote nothing)."""
+    codex_home = tmp_path / ".codex"
+    env = {
+        **os.environ,
+        "CODEX_HOME": str(codex_home),
+        "HOME": str(tmp_path),
+        "WORKSPACE_CONFIG_PATH": str(tmp_path / "no-configs"),
+        **env_extra,
+    }
+    subprocess.run(
+        ["bash", str(_CODEX_MINIMAX_SH)],
+        env=env, check=True, capture_output=True, text=True,
+    )
+    cfg = codex_home / "config.toml"
+    return cfg.read_text() if cfg.exists() else ""
+
+
+def test_subscription_present_skips_minimax_block(tmp_path) -> None:
+    """Prod path: CODEX_AUTH_JSON + MINIMAX_API_KEY both set. The
+    minimax provider block MUST NOT be written, so codex falls back
+    to its built-in subscription provider (Responses API, gpt-5.5 via
+    thread/start). Fails on the old (minimax-forced) behavior."""
+    body = _gen_config(tmp_path, {
+        "CODEX_AUTH_JSON": '{"auth_mode":"chatgpt","tokens":{}}',
+        "MINIMAX_API_KEY": "sk-cp-test-prod-both-set",
+    })
+    assert "model_provider = \"minimax\"" not in body, (
+        "minimax provider block written while the ChatGPT/Codex "
+        "subscription is present — codex will POST to "
+        "api.minimax.io/v1/responses and 404 (internal#513).\n" + body
+    )
+    assert "api.minimax.io" not in body, (
+        "base_url still points at api.minimax.io with a subscription "
+        "credential present (internal#513).\n" + body
+    )
+    assert "codex-MiniMax-M2.7" not in body, (
+        "minimax model still pinned with a subscription present.\n" + body
+    )
+
+
+def test_subscription_alias_also_skips_minimax_block(tmp_path) -> None:
+    """The PR#5 backward-compat alias CODEX_CHATGPT_AUTH_JSON must
+    also suppress the minimax block."""
+    body = _gen_config(tmp_path, {
+        "CODEX_CHATGPT_AUTH_JSON": '{"auth_mode":"chatgpt"}',
+        "MINIMAX_API_KEY": "sk-cp-test-alias",
+    })
+    assert "minimax" not in body, (
+        "minimax block written under the CODEX_CHATGPT_AUTH_JSON "
+        "alias path (internal#513).\n" + body
+    )
+
+
+def test_minimax_only_still_writes_minimax_block(tmp_path) -> None:
+    """Regression floor for the alt leg: with NO subscription and
+    MINIMAX_API_KEY set, the minimax block must still be emitted
+    (the internal#514 alt path is not removed, just subordinated)."""
+    body = _gen_config(tmp_path, {"MINIMAX_API_KEY": "sk-cp-test-alt-only"})
+    assert "model_provider = \"minimax\"" in body, (
+        "minimax-only path no longer writes the minimax block — the "
+        "internal#514 alt leg must not be removed, only subordinated "
+        "to the subscription.\n" + body
+    )
+    # And its wire_api must remain the CLI-0.130 parse-valid value.
+    import re
+    assigns = re.findall(r'(?m)^\s*wire_api\s*=\s*"([^"]+)"', body)
+    assert assigns == ["responses"], assigns
+
+
+def test_no_credentials_writes_nothing(tmp_path) -> None:
+    """No subscription, no MINIMAX_API_KEY: still a true no-op so the
+    direct-OPENAI_API_KEY path sees no config.toml provider override."""
+    body = _gen_config(tmp_path, {"MINIMAX_API_KEY": ""})
+    assert body == "", f"expected no config.toml; got:\n{body}"
+
+
+def test_subscription_then_mode_c_yields_no_provider_override(
+    tmp_path,
+) -> None:
+    """Boot-order integration: minimax script (skips) → mode-C probe
+    (appends auth keys). Final config.toml must carry the subscription
+    auth keys and NO model_provider/base_url override, matching the
+    verified working device-logged codex-0.130 shape."""
+    # 1. minimax script with subscription present -> writes nothing.
+    body = _gen_config(tmp_path, {
+        "CODEX_AUTH_JSON": '{"auth_mode":"chatgpt","tokens":{}}',
+        "MINIMAX_API_KEY": "sk-cp-test-integration",
+    })
+    assert body == "", f"minimax script should be inert here:\n{body}"
+    # 2. mode-C probe appends auth keys onto the (absent) config.toml.
+    codex_dir = _run_probe({
+        "CODEX_AUTH_JSON": '{"auth_mode":"chatgpt","tokens":{}}',
+        "__TMP_HOME": str(tmp_path),
+    })
+    final = (codex_dir / "config.toml").read_text()
+    assert "model_provider" not in final, (
+        "config.toml carries a model_provider override on the "
+        "subscription path — codex must use its built-in provider "
+        "(internal#513).\n" + final
+    )
+    assert "api.minimax.io" not in final
+    assert 'forced_login_method = "chatgpt"' in final
+    assert 'cli_auth_credentials_store = "file"' in final
+
+
 def _run_probe(env: dict) -> Path:
     home = Path(env["__TMP_HOME"])
     script = _MODE_C_PROBE.replace("/home/agent", str(home))
