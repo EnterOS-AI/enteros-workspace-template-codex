@@ -56,12 +56,16 @@ def test_default_model_is_gpt_5_5() -> None:
     assert cfg["runtime_config"]["model"] == "gpt-5.5"
 
 
-def test_roster_is_exactly_the_verified_may_2026_set() -> None:
+def test_roster_includes_verified_may_2026_openai_set() -> None:
+    """The OpenAI gpt-* May-2026 roster must remain in the model list.
+    The set is no longer EQUALITY-asserted because feat/multi-provider-
+    abstraction adds third-party provider entries (e.g. MiniMax codex)
+    alongside the OpenAI roster — but every verified OpenAI id must
+    still appear so the canvas Config dropdown surfaces them."""
     cfg = _load_config()
     ids = {m["id"] for m in cfg["runtime_config"]["models"]}
-    assert ids == _VALID_MAY_2026_IDS, (
-        f"roster {ids} != verified May-2026 set {_VALID_MAY_2026_IDS}"
-    )
+    missing = _VALID_MAY_2026_IDS - ids
+    assert not missing, f"verified OpenAI roster missing from models: {missing}"
 
 
 def test_no_dead_ids_remain() -> None:
@@ -72,10 +76,28 @@ def test_no_dead_ids_remain() -> None:
 
 
 def test_every_model_has_a_name_and_required_env() -> None:
+    """Every entry must declare ``name`` + a ``required_env`` referencing
+    the registry. The previous version pinned required_env to exactly
+    ``[OPENAI_API_KEY]`` which assumed a single-provider runtime; the
+    multi-provider abstraction allows per-entry credential names (e.g.
+    MINIMAX_API_KEY for the MiniMax codex models)."""
     cfg = _load_config()
+    # Build the set of env names declared in the top-level providers
+    # registry — every model's required_env must reference one of them.
+    valid_env_names: set = set()
+    for prov in cfg.get("providers", []):
+        for ev in prov.get("auth_env", []) or []:
+            valid_env_names.add(ev)
+    assert valid_env_names, "providers registry must declare auth_env names"
     for m in cfg["runtime_config"]["models"]:
         assert m.get("name"), f"model {m} missing name"
-        assert m.get("required_env") == ["OPENAI_API_KEY"]
+        req = m.get("required_env") or []
+        assert req, f"model {m} missing required_env"
+        for ev in req:
+            assert ev in valid_env_names, (
+                f"model {m['id']} required_env={req} references "
+                f"{ev!r} which no provider in the registry declares"
+            )
 
 
 # --- Group 2: adapter preflight (mode C) -----------------------------------

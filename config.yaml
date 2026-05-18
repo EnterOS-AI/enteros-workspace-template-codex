@@ -5,10 +5,101 @@ description: >-
   so A2A messages process in-order with full conversation continuity —
   no fresh subprocess per turn.
 
-  Provider is OpenAI (codex is OpenAI-only). Set OPENAI_API_KEY in the
-  workspace's environment via the canvas Config tab.
-version: 0.1.0
+  Three auth paths are supported (adapter picks at boot via the
+  `providers:` registry below):
+    A. Codex/ChatGPT subscription via CODEX_AUTH_JSON (auth.json blob;
+       preferred when present — overrides the model-prefix match so a
+       workspace with both a subscription and a vendor key like
+       MINIMAX_API_KEY routes to the subscription as intended).
+    B. Direct OpenAI API key via OPENAI_API_KEY (codex's documented
+       pay-as-you-go fallback).
+    C. Third-party endpoint serving the OpenAI Responses API on a
+       vendor-specific base_url + env key (e.g. MiniMax token-plan).
+       Add a new such provider by appending one entry to `providers:` —
+       no adapter or boot-script code changes needed.
+version: 0.2.0
 tier: 2
+
+# Provider registry — single source of truth for codex provider routing.
+# The adapter reads this list at boot, resolves the picked model + env
+# credentials to a provider entry, and renders ~/.codex/config.toml
+# accordingly (no override for built-in OpenAI auth modes; a
+# [model_providers.<slug>] block for openai_compat_responses).
+#
+# Adding a new provider = one entry below. The boot scripts stay
+# generic and open-source-friendly: vendor URLs and env-var names are
+# public/documented (e.g. api.openai.com, api.minimax.io), with no
+# deployer-specific infrastructure baked into the template.
+#
+# Schema per entry:
+#   name                  : human-readable label (used in boot banner).
+#   auth_mode             : one of
+#       chatgpt_subscription      — auth.json blob via CODEX_AUTH_JSON
+#                                   (or CODEX_CHATGPT_AUTH_JSON alias);
+#                                   no config.toml model_provider override
+#                                   so codex uses its native OpenAI/Responses
+#                                   provider, with the model picked via
+#                                   thread/start from runtime_config.model.
+#       openai_api                — direct OpenAI key via OPENAI_API_KEY;
+#                                   same "no override" shape as above.
+#       openai_compat_responses   — third-party Responses-API endpoint;
+#                                   adapter renders a [model_providers.<slug>]
+#                                   block + model_provider = "<slug>" pin.
+#   model_prefixes        : lowercase model-id prefixes for routing match.
+#   model_aliases         : exact lowercase model ids for routing match.
+#   base_url              : null for built-in OpenAI modes; HTTPS URL for
+#                           openai_compat_responses.
+#   auth_env              : env-var names the adapter checks for satisfied
+#                           credentials. First non-built-in entry is the
+#                           "env_key" emitted to config.toml for compat
+#                           providers.
+#   wire_api              : optional; defaults to "responses". CLI 0.130
+#                           removed the "chat" variant — only "responses"
+#                           is parse-valid today. Left in registry so a
+#                           future shim re-introducing a chat-style wire
+#                           is a YAML edit.
+#   model_provider_slug   : optional TOML slug; defaults to `name` if
+#                           absent.
+#   model_id_override     : optional model id to write into config.toml
+#                           when the wire-protocol model name differs
+#                           from the canvas-shown id (e.g. MiniMax's
+#                           codex-MiniMax-M2.7 vs the generic gpt-* line).
+providers:
+  - name: openai-subscription
+    auth_mode: chatgpt_subscription
+    model_prefixes: [gpt-]
+    model_aliases: []
+    base_url: null
+    # CODEX_AUTH_JSON wins over the older CODEX_CHATGPT_AUTH_JSON alias
+    # when both are set (preserves the pre-existing precedence).
+    auth_env: [CODEX_AUTH_JSON, CODEX_CHATGPT_AUTH_JSON]
+
+  - name: openai-api
+    auth_mode: openai_api
+    model_prefixes: [gpt-]
+    model_aliases: []
+    base_url: null
+    auth_env: [OPENAI_API_KEY]
+
+  # MiniMax token-plan codex CLI route. The endpoint is documented at
+  # platform.minimax.io/docs/token-plan/codex-cli. KNOWN LIMITATION:
+  # MiniMax's token-plan endpoint serves OpenAI Chat-Completions, NOT
+  # the Responses API. CLI 0.130 hard-removed the `chat` wire variant,
+  # so this leg parses + boots cleanly under wire_api = "responses" but
+  # the runtime call to /v1/responses 404s on MiniMax's side. The
+  # registry entry stays in the open-source default so any deployer
+  # that adds a Responses-supporting MiniMax variant (proxy / future
+  # MiniMax feature) just sets MINIMAX_API_KEY and works — no code
+  # change. Tracked as a downstream-vendor gap, not a template defect.
+  - name: minimax-token-plan
+    auth_mode: openai_compat_responses
+    model_prefixes: [codex-minimax-, minimax-codex-, minimax-]
+    model_aliases: []
+    base_url: https://api.minimax.io/v1
+    auth_env: [MINIMAX_API_KEY]
+    wire_api: responses
+    model_provider_slug: minimax
+    model_id_override: codex-MiniMax-M2.7
 
 runtime: codex
 runtime_config:
@@ -24,40 +115,55 @@ runtime_config:
   # deliberately alongside the @openai/codex pin (RFC §1, §6).
   model: gpt-5.5
 
-  # Models surfaced in the canvas Config tab dropdown. The
-  # OPENAI_API_KEY requirement is the direct-OpenAI path; the
-  # MiniMax (codex_minimax_config.sh) and the single-runner
-  # ChatGPT-subscription auth.json paths satisfy auth without it
-  # (see adapter.setup() / start.sh). required_env stays declared
-  # for the canvas dropdown UX on the direct path.
+  # Models surfaced in the canvas Config tab dropdown. Per-entry
+  # required_env follows the picked auth path: gpt-* lines accept
+  # either CODEX_AUTH_JSON (subscription) or OPENAI_API_KEY (direct).
+  # MiniMax codex entries route through the `minimax-token-plan`
+  # provider (see top-level `providers:` registry) and require
+  # MINIMAX_API_KEY only. The adapter resolves the actual provider
+  # from this list + the env at boot; required_env here drives the
+  # canvas validation hint, not the resolution itself.
   models:
     - id: gpt-5.5
-      name: GPT-5.5
+      name: GPT-5.5 (OpenAI subscription or API key)
       required_env: [OPENAI_API_KEY]
     - id: gpt-5.4
-      name: GPT-5.4
+      name: GPT-5.4 (OpenAI subscription or API key)
       required_env: [OPENAI_API_KEY]
     - id: gpt-5.4-mini
-      name: GPT-5.4 mini
+      name: GPT-5.4 mini (OpenAI subscription or API key)
       required_env: [OPENAI_API_KEY]
     - id: gpt-5.3-codex
-      name: GPT-5.3 Codex
+      name: GPT-5.3 Codex (OpenAI subscription or API key)
       required_env: [OPENAI_API_KEY]
     - id: gpt-5.3-codex-spark
-      name: GPT-5.3 Codex Spark
+      name: GPT-5.3 Codex Spark (OpenAI subscription or API key)
       required_env: [OPENAI_API_KEY]
     - id: gpt-5.2
-      name: GPT-5.2
+      name: GPT-5.2 (OpenAI subscription or API key)
       required_env: [OPENAI_API_KEY]
 
-  # All codex models share this requirement on the direct-OpenAI
-  # path. MiniMax / ChatGPT-auth.json paths are gated separately.
+    # MiniMax token-plan codex route — public endpoint
+    # (api.minimax.io). See `providers:` registry note on the
+    # Chat-vs-Responses compatibility gap; entries kept so the
+    # canvas surfaces the option for any deployer that adds a
+    # Responses-supporting variant.
+    - id: codex-minimax-m2.7
+      name: MiniMax M2.7 codex (third-party token-plan)
+      required_env: [MINIMAX_API_KEY]
+
+  # Default required_env — the canvas surfaces this when no model is
+  # picked. OPENAI_API_KEY is the documented direct path; subscription
+  # and MiniMax paths are validated by the adapter via the registry.
   required_env: [OPENAI_API_KEY]
 
-  # Single-provider runtime; surfaced as the only entry in the canvas
-  # Provider dropdown.
+  # Provider names surfaced in the canvas Config tab dropdown. The
+  # actual routing decision is made in adapter.setup() against the
+  # top-level `providers:` registry; this list is the UI surface.
   providers:
-    - openai
+    - openai-subscription
+    - openai-api
+    - minimax-token-plan
 
   # 0 = no executor-side timeout. Per-turn timeout is enforced inside
   # executor.py at _TURN_TIMEOUT (currently 600s).

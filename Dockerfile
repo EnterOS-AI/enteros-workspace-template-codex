@@ -99,19 +99,36 @@ RUN pip install --no-cache-dir -r requirements.txt && \
     fi && \
     python3 -c "import molecule_runtime.preflight as pf; s=getattr(pf,'SUPPORTED_RUNTIMES',None); s.add('codex') if isinstance(s,set) else None; print('preflight SUPPORTED_RUNTIMES shim:', 'patched' if isinstance(s,set) else 'n/a (adapter-module discovery is authoritative)')" || true
 
-COPY adapter.py executor.py app_server.py __init__.py ./
+COPY adapter.py executor.py app_server.py provider_config.py __init__.py ./
+COPY config.yaml ./
 COPY start.sh /usr/local/bin/start.sh
 # Provider/MCP config helpers — invoked by start.sh on every boot.
-# codex_minimax_config.sh writes ~/.codex/config.toml (MiniMax provider
-# routing); codex_mcp_config.sh appends the molecule A2A MCP server
-# block (list_peers / delegate_task / commit_memory) and resolves the
+#
+# render_provider_toml.py is the new YAML-driven entry point: reads
+# `providers:` from config.yaml, resolves to the right provider for
+# the env, and writes ~/.codex/config.toml accordingly. Replaces the
+# legacy hardcoded codex_minimax_config.sh path.
+#
+# codex_minimax_config.sh is kept as a compat fallback (one release)
+# for downstream ops scripts and existing tests that exec it directly;
+# start.sh prefers the python helper when available.
+#
+# codex_mcp_config.sh appends the molecule A2A MCP server block
+# (list_peers / delegate_task / commit_memory) and resolves the
 # correct CONFIGS_DIR so the MCP child reads the same .auth_token the
 # runtime writes (the list_peers-401 fix). start.sh probes both
 # /usr/local/bin and /app — install to /usr/local/bin (the primary).
+COPY render_provider_toml.py /usr/local/bin/render_provider_toml.py
+# provider_config.py is imported by render_provider_toml.py at runtime;
+# co-install into /usr/local/bin so the script can find it from there
+# (the `_HERE` sys.path insert in render_provider_toml.py picks it up).
+# It also lives in /app via the COPY above for adapter.py import.
+COPY provider_config.py /usr/local/bin/provider_config.py
 COPY codex_minimax_config.sh codex_mcp_config.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/start.sh \
              /usr/local/bin/codex_minimax_config.sh \
-             /usr/local/bin/codex_mcp_config.sh
+             /usr/local/bin/codex_mcp_config.sh \
+             /usr/local/bin/render_provider_toml.py
 
 # --- Install the OpenAI Codex CLI globally as root (binary lives in
 # /usr/lib/node_modules and symlinks into /usr/bin/codex; available to
