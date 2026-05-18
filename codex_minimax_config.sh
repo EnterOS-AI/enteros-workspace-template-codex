@@ -35,8 +35,10 @@
 # boot, incl. the subscription path). This is acceptable because no
 # prod agent uses the MiniMax leg today (subscription is `Preferred`
 # per README; OPENAI_API_KEY is the documented fallback) — both of
-# those are native Responses providers. Tracked: see PR body / a
-# dedicated follow-up issue for the MiniMax-Responses gap.
+# those are native Responses providers. Tracked: molecule-ai/internal#514
+# ("codex MiniMax token-plan leg incompatible with CLI 0.130 Responses-API,
+# deferred from #513") — the dedicated follow-up for the MiniMax-Responses
+# gap; internal#513 remains this change's cutover-blocker.
 #
 # When MINIMAX_API_KEY is missing this is a no-op so OpenAI-direct
 # users see no behavior change.
