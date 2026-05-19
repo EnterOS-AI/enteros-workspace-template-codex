@@ -157,6 +157,71 @@ async def test_setup_ignores_empty_auth_json(_adapter, monkeypatch, tmp_path):
         await _adapter.setup(AdapterConfig(model="gpt-5.5"))
 
 
+@pytest.mark.asyncio
+async def test_setup_fails_closed_when_model_is_provider_name(
+    _adapter, monkeypatch, tmp_path,
+):
+    """Defense-in-depth for the CP workspace-config writer bug (2026-05-18
+    Reviewer + Researcher wedge): if the YAML ``model:`` field carries a
+    PROVIDER name (e.g. ``openai-subscription``) instead of a real model
+    id, codex thread/start silently accepts the garbage and wedges. We
+    abort at adapter setup() BEFORE codex sees it. Mirrors the
+    ``RUNTIME_PIN_MISSING`` 422 shape the CP itself emits when its own
+    invariant fails — fail-closed, name the invariant, point at the
+    operator action (here: the writer to fix)."""
+    if not shutil.which("codex"):
+        pytest.skip("codex binary not on PATH (container-only check)")
+    _clear_creds(monkeypatch)
+    # Satisfy the credential preflight so we're explicitly testing the
+    # model-vs-provider-name check, not the no-credential branch.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+    # MODEL_PROVIDER env must be unset so the explicit-provider branch
+    # doesn't preempt the assertion under test (the canvas-saved Config
+    # path doesn't set this env var, only the persona-env layer does).
+    monkeypatch.delenv("MODEL_PROVIDER", raising=False)
+    from molecule_runtime.adapters.base import AdapterConfig
+    # Simulate the field bug: provider name landed in the model: YAML
+    # field, so adapter.setup() reads it back as
+    # runtime_config={"model": "openai-subscription"} (the production
+    # shape — the canvas Config tab writes here, and the CP provisioner
+    # also stamps it via /configs/config.yaml's `model:` top-level key
+    # which molecule-runtime merges into runtime_config on load).
+    with pytest.raises(RuntimeError) as exc:
+        await _adapter.setup(AdapterConfig(
+            model="openai-subscription",
+            runtime_config={"model": "openai-subscription"},
+        ))
+    msg = str(exc.value)
+    # The error MUST name the bad value verbatim so the operator can
+    # grep their workspace-config write trail and find the writer.
+    assert "openai-subscription" in msg
+    # The error MUST point at the workspace-config writer (the actual
+    # root cause is upstream of this template).
+    assert (
+        "workspace-config writer" in msg.lower()
+        or "provisioner" in msg.lower()
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_passes_for_real_model_id(_adapter, monkeypatch, tmp_path):
+    """Sanity: a real codex roster model id passes the new check (the
+    common case must not regress)."""
+    if not shutil.which("codex"):
+        pytest.skip("codex binary not on PATH (container-only check)")
+    _clear_creds(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+    monkeypatch.delenv("MODEL_PROVIDER", raising=False)
+    from molecule_runtime.adapters.base import AdapterConfig
+    # gpt-5.5 is the verified May-2026 codex default. Should NOT raise.
+    await _adapter.setup(AdapterConfig(
+        model="gpt-5.5",
+        runtime_config={"model": "gpt-5.5"},
+    ))
+
+
 # --- Group 3: start.sh mode-C structural behavior --------------------------
 # We can't run the full start.sh (it execs molecule-runtime). Instead we
 # extract the mode-C block and run it in isolation with a fake HOME, then

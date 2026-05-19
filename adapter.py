@@ -163,6 +163,7 @@ class CodexAdapter(BaseAdapter):
 
         try:
             from provider_config import (
+                assert_model_is_not_provider_name,
                 load_providers, resolve_provider, write_config_toml,
             )
         except ImportError as exc:
@@ -181,6 +182,18 @@ class CodexAdapter(BaseAdapter):
         providers = load_providers(
             workspace_config_path=getattr(config, "config_path", "") or "",
         )
+
+        # Defense-in-depth for the CP workspace-config writer bug
+        # (2026-05-18 Reviewer + Researcher wedge): if the upstream
+        # writer stamped a PROVIDER name into the YAML `model:` field
+        # (e.g. model: 'openai-subscription'), refuse to boot rather
+        # than letting codex thread/start accept the garbage and wedge.
+        # Either side alone closes the bug — see
+        # `assert_model_is_not_provider_name` doc + the structural fix
+        # in molecule-controlplane's userdata_containerized.go /
+        # ec2.go writer.
+        assert_model_is_not_provider_name(yaml_model, providers)
+
         try:
             picked = resolve_provider(
                 yaml_model, providers,
