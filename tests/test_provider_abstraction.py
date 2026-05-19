@@ -294,3 +294,79 @@ def test_write_compat_writes_file_with_responses_wire(pc, tmp_path):
     assert 'wire_api = "responses"' in body
     assert 'wire_api = "chat"' not in body
     assert "api.minimax.io" in body
+
+
+# --- Group 6: assert_model_is_not_provider_name ---------------------------
+#
+# Defense-in-depth: when the upstream workspace-config writer (CP
+# provisioner) gets confused and stamps a PROVIDER name (e.g.
+# "openai-subscription") into the YAML `model:` field, codex's
+# thread/start would silently take "openai-subscription" as a model id
+# and either 4xx-loop or wedge. We catch this at adapter setup() and
+# abort with a structured 422-style error pointing at the writer.
+# Pairs with the CP-side fix; either side alone closes the bug, both
+# together is defense-in-depth.
+
+def test_assert_model_is_not_provider_name_passes_for_real_model(pc):
+    """Real model ids in the model: field do NOT raise."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    # Real codex roster (verified May-2026 in test_modernization_pr1):
+    for model_id in ("gpt-5.5", "gpt-5.4", "codex-minimax-m2.7", ""):
+        # Should not raise.
+        pc.assert_model_is_not_provider_name(model_id, providers)
+
+
+def test_assert_model_is_not_provider_name_passes_for_none(pc):
+    """``None`` (no model picked) does NOT raise — the workspace can boot
+    with codex's thread/start default."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    pc.assert_model_is_not_provider_name(None, providers)
+
+
+def test_assert_model_is_not_provider_name_raises_on_openai_subscription(pc):
+    """The exact bug shape from the field reports (Reviewer + Researcher
+    wedge 2026-05-18/19): MODEL_PROVIDER='openai-subscription' got
+    stamped into the YAML `model:` field by the CP writer. Adapter
+    setup() must abort BEFORE codex thread/start sees the garbage."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    with pytest.raises(RuntimeError) as exc:
+        pc.assert_model_is_not_provider_name(
+            "openai-subscription", providers,
+        )
+    msg = str(exc.value)
+    # Names the bad value verbatim so the operator sees the bug.
+    assert "openai-subscription" in msg
+    # Names the registry entry it collided with so the operator can map
+    # back to which provider this value belongs in.
+    assert "provider name" in msg.lower()
+    # Points at the writer (the CP provisioner) — the actual root cause.
+    assert "workspace-config writer" in msg.lower() or "provisioner" in msg.lower()
+
+
+def test_assert_model_is_not_provider_name_raises_on_openai_api(pc):
+    """Same shape for the openai-api provider name."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    with pytest.raises(RuntimeError, match="openai-api"):
+        pc.assert_model_is_not_provider_name(
+            "openai-api", providers,
+        )
+
+
+def test_assert_model_is_not_provider_name_raises_on_minimax_token_plan(pc):
+    """Same shape for the minimax-token-plan provider name."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    with pytest.raises(RuntimeError, match="minimax-token-plan"):
+        pc.assert_model_is_not_provider_name(
+            "minimax-token-plan", providers,
+        )
+
+
+def test_assert_model_is_not_provider_name_is_case_insensitive(pc):
+    """The provider registry's name is lowercased on the match path so a
+    capitalization typo in the writer (OpenAI-Subscription) still
+    raises — matching ``resolve_provider``'s case-insensitive shape."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    with pytest.raises(RuntimeError, match="(?i)openai-subscription"):
+        pc.assert_model_is_not_provider_name(
+            "OpenAI-Subscription", providers,
+        )

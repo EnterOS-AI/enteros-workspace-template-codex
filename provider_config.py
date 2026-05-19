@@ -186,6 +186,67 @@ _TEMPLATE_DIR = Path(__file__).resolve().parent
 _CANONICAL_ADAPTER_DIR = Path("/opt/adapter")
 
 
+# --- Defense-in-depth: catch the CP workspace-config writer bug -----------
+#
+# Field-observed bug shape (prod-Reviewer + prod-Researcher wedge,
+# 2026-05-18/19): the upstream CP provisioner's workspace-config writer
+# conflated the ``MODEL`` env var (a model id like ``gpt-5.5``) with the
+# ``MODEL_PROVIDER`` env var (a provider name like ``openai-subscription``)
+# and stamped the PROVIDER name into the YAML ``model:`` field. Codex
+# thread/start then takes ``"openai-subscription"`` as a model id and
+# either 4xx-loops or silently wedges (the executor's reader thread
+# blocks in wait4 — see
+# ``reference_codex_prod_reviewer_researcher_wedge_in_executor_not_codex_2026_05_18``).
+#
+# The structural fix lives in the CP provisioner. This helper is the
+# template-side defense-in-depth: at adapter.setup() the template
+# refuses to boot when it sees a provider name in the model field, and
+# emits a structured error pointing operators at the writer. Either
+# side alone closes the bug; both together is the class-fix.
+
+def assert_model_is_not_provider_name(
+    model: Optional[str],
+    providers: Sequence[dict],
+) -> None:
+    """Raise ``RuntimeError`` when ``model`` matches a provider registry name.
+
+    No-op when ``model`` is ``None``, empty, or a non-matching string.
+    Case-insensitive against the registry's ``name`` field (matching
+    ``resolve_provider``'s shape so a capitalization typo in the
+    upstream writer doesn't slip through).
+    """
+    if not model:
+        return
+    m = model.strip().lower()
+    if not m:
+        return
+    for provider in providers:
+        if provider["name"].lower() == m:
+            known = ", ".join(p["name"] for p in providers)
+            raise RuntimeError(
+                f"codex adapter: refusing to boot — MODEL value "
+                f"{model!r} is a PROVIDER NAME, not a model id. "
+                f"This is the workspace-config writer bug (CP "
+                f"provisioner stamped MODEL_PROVIDER into the YAML "
+                f"`model:` field). Codex thread/start would silently "
+                f"accept this garbage and either 4xx-loop or wedge."
+                f"\n\n"
+                f"Provider registry names (do NOT pass these as "
+                f"`model:`): {known}\n"
+                f"\n"
+                f"Fix path: update the workspace-config writer in "
+                f"molecule-controlplane "
+                f"(internal/provisioner/userdata_containerized.go's "
+                f"buildModelProviderYAML and "
+                f"internal/provisioner/ec2.go's MODEL_PROVIDER "
+                f"persistence block) to write the MODEL env value "
+                f"(real model id, e.g. 'gpt-5.5') into `model:` and "
+                f"the MODEL_PROVIDER env value (registry provider "
+                f"name, e.g. {provider['name']!r}) into `provider:` "
+                f"separately."
+            )
+
+
 def load_providers(workspace_config_path: str = "") -> tuple:
     """Read the provider registry from the template's ``config.yaml``.
 
