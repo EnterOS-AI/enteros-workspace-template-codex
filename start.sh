@@ -37,6 +37,28 @@ if [ "$(id -u)" = "0" ]; then
   chown -R agent:agent /configs 2>/dev/null || true
 fi
 
+# Multi-line workspace_secrets (e.g. CODEX_AUTH_JSON, a JSON blob with
+# embedded newlines) cannot ride docker's --env-file because Docker's
+# parser would split the value into two attacker-controlled KEY=value
+# records. molecule-controlplane writes them instead to
+# /configs/secrets.d/<KEY> + a generated load.sh that exports each.
+# Sourcing here makes the values visible to the boot-context snapshot
+# below AND to every downstream consumer (CODEX_AUTH_BLOB resolution,
+# auth.json materialization, codex_auth_refresh watchdog).
+#
+# Inert when the file is absent — older workspaces and other templates
+# without multi-line secrets boot unchanged. Pre-2026-05-19 incident:
+# CODEX_AUTH_JSON was silently dropped by the controlplane provisioner
+# (newline filter in buildContainerizedUserData) → prod-Researcher
+# 712b5600-d397-4749-adac-cd6ee574afea and prod-Reviewer
+# 38f1c367-4e73-49a0-ad8b-6e2f8e7072c7 had no ~/.codex/auth.json and
+# 401'd on every codex turn. Fix lands as molecule-controlplane PR
+# pairing with this change.
+if [ -f /configs/secrets.d/load.sh ]; then
+  # shellcheck disable=SC1091
+  . /configs/secrets.d/load.sh
+fi
+
 # Boot-context snapshot — emitted on EVERY container start. Lets
 # `docker logs` answer "what env / uid was actually present?" without
 # docker exec into a possibly-dying container. Logs NAMES of
