@@ -38,7 +38,10 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 
 from molecule_runtime.adapters.base import AdapterConfig
-from molecule_runtime.executor_helpers import extract_message_text
+from molecule_runtime.executor_helpers import (
+    extract_attached_files,
+    extract_message_text,
+)
 
 from app_server import AppServerError, AppServerProcess
 
@@ -167,12 +170,32 @@ class CodexAppServerExecutor(AgentExecutor):
     # AgentExecutor contract
     # ------------------------------------------------------------------
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        prompt = extract_message_text(context.message) or ""
-        if not prompt.strip():
+        text = extract_message_text(context.message) or ""
+        # Phase 1 file-only message support (a1ea2200 archaeology — chloe-dong
+        # PDF-only canary 2026-05-20 01:04:27Z surfaced the opaque
+        # "(empty prompt — nothing to do)" reply). Mirror the claude-code
+        # reference impl (claude_sdk_executor.py:644-650): surface attached
+        # files to codex as a manifest in the prompt — codex reads files
+        # through its own tools by path. Phase 2 will wire actual
+        # file-content forwarding via codex's input parts.
+        attached = extract_attached_files(context.message)
+        if attached:
+            manifest = "\n\nAttached files:\n" + "\n".join(
+                f"- {f['name']} ({f['mime_type'] or 'unknown type'}) at {f['path']}"
+                for f in attached
+            )
+            text = (text + manifest) if text.strip() else manifest.lstrip()
+        if not text.strip():
+            # Truly empty — actionable per
+            # feedback_surface_actionable_failure_reason_to_user.
             await event_queue.enqueue_event(
-                new_text_message("(empty prompt — nothing to do)")
+                new_text_message(
+                    "Your message was empty. Please send text or a file "
+                    "with instructions."
+                )
             )
             return
+        prompt = text
 
         # Push parity with claude-code: when a new message arrives while
         # a turn is already in flight, inject it into the active turn
