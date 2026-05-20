@@ -149,6 +149,32 @@ RUN chmod +x /usr/local/bin/start.sh \
              /usr/local/bin/render_provider_toml.py \
              /usr/local/bin/codex_auth_refresh.sh
 
+# Build-time smoke check for the OAuth refresh watchdog (PR#24
+# regression-pin). Pre-PR#24 the script hardcoded
+# /opt/molecule-venv/bin/python3, a path that does NOT exist in this
+# image (we build FROM python:3.11-slim → python3 at
+# /usr/local/bin/python3). Every helper invocation exited 127, OAuth
+# refresh never fired, id_token expired silently, Researcher wedged
+# upstream of stdout (ae2c3012 diagnosis). This RUN executes the
+# watchdog's `--once` path against an absent CODEX_HOME — which exercises
+# the python3 resolver AND the absent-auth.json skip branch. Expected
+# rc=1 (skip:no_auth_json); rc=127 means the python3 path regressed and
+# the image must fail to build, NEVER ship.
+RUN set -eux; \
+    bash -n /usr/local/bin/codex_auth_refresh.sh; \
+    rc=0; \
+    CODEX_HOME=/tmp/.codex-smoke-no-auth /usr/local/bin/codex_auth_refresh.sh --once || rc=$?; \
+    rm -rf /tmp/.codex-smoke-no-auth; \
+    if [ "$rc" -eq 127 ]; then \
+      echo "FATAL: codex_auth_refresh.sh exited 127 at image-build smoke — python3 helper not located. PR#19 OAuth auto-refresh would ship broken (PR#24 regression-pin)." >&2; \
+      exit 1; \
+    fi; \
+    if [ "$rc" -ne 1 ]; then \
+      echo "FATAL: codex_auth_refresh.sh smoke produced rc=$rc (expected rc=1 skip:no_auth_json). Image-build watchdog smoke failed." >&2; \
+      exit 1; \
+    fi; \
+    echo "[image-build smoke] codex_auth_refresh.sh OAuth watchdog OK (rc=1 skip:no_auth_json — python3 helper resolves)."
+
 # --- Install the OpenAI Codex CLI globally as root (binary lives in
 # /usr/lib/node_modules and symlinks into /usr/bin/codex; available to
 # both root and the agent user).

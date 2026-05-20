@@ -68,6 +68,20 @@ CODEX_HOME="${CODEX_HOME:-/home/agent/.codex}"
 AUTH_JSON="${CODEX_HOME}/auth.json"
 STATUS_FILE="${CODEX_HOME}/auth_refresh_status.json"
 
+# Resolve python3 portably. PR#19 (internal#569) hardcoded
+# /opt/molecule-venv/bin/python3, but the codex image is built FROM
+# python:3.11-slim with python3 at /usr/local/bin/python3 — no
+# /opt/molecule-venv exists. Every helper invocation exited 127 →
+# OAuth refresh never fired → id_token expired silently and Researcher
+# wedged upstream of stdout (ae2c3012 diagnosis). Override via
+# CODEX_PYTHON for test/dev rigs that need a custom interpreter.
+PYTHON_BIN="${CODEX_PYTHON:-$(command -v python3 || true)}"
+if [ -z "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
+  printf '[codex_auth_refresh %s] FATAL: python3 not found on PATH (CODEX_PYTHON=%s); the watchdog cannot run.\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${CODEX_PYTHON:-<unset>}" >&2
+  exit 127
+fi
+
 # Tunable via env. Defaults come from RFC §"Proposed fix" + CLI source:
 #   - REFRESH_INTERVAL: how often the loop wakes (6h)
 #   - SAFETY_MARGIN:    refresh if access_token exp - now < this (4h)
@@ -98,7 +112,7 @@ needs_refresh_and_payload() {
   # Note: <refresh_token> is on stdout for the caller to consume in a
   # variable. Caller MUST NOT echo it. The wrapper below redacts it
   # before any logging.
-  /opt/molecule-venv/bin/python3 - "$AUTH_JSON" "$SAFETY_MARGIN" "$STALE_AFTER" <<'PY'
+  "$PYTHON_BIN" - "$AUTH_JSON" "$SAFETY_MARGIN" "$STALE_AFTER" <<'PY'
 import base64, json, sys, time
 from datetime import datetime, timezone
 
@@ -198,7 +212,7 @@ PY
 # for the response would collide with the heredoc.
 apply_refresh_response() {
   local response_file="$1"
-  /opt/molecule-venv/bin/python3 - "$AUTH_JSON" "$response_file" <<'PY'
+  "$PYTHON_BIN" - "$AUTH_JSON" "$response_file" <<'PY'
 import json, os, stat, sys, tempfile
 from datetime import datetime, timezone
 
@@ -268,7 +282,7 @@ PY
 # Write the status sidecar (mode 0600). Never includes token contents.
 write_status() {
   local last_iso="$1" age="$2" outcome="$3"
-  /opt/molecule-venv/bin/python3 - "$STATUS_FILE" "$last_iso" "$age" "$outcome" <<'PY'
+  "$PYTHON_BIN" - "$STATUS_FILE" "$last_iso" "$age" "$outcome" <<'PY'
 import json, os, stat, sys
 path, last_iso, age, outcome = sys.argv[1:5]
 payload = {
@@ -317,7 +331,7 @@ attempt_refresh_once() {
       # Re-parse just to refresh the sidecar — separate, doesn't see
       # the token because no refresh body is emitted.
       local last_iso age
-      read -r last_iso age <<<"$(/opt/molecule-venv/bin/python3 - "$AUTH_JSON" <<'PY'
+      read -r last_iso age <<<"$("$PYTHON_BIN" - "$AUTH_JSON" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 try:
@@ -370,7 +384,7 @@ PY
   local response_file http_code
   response_file="$(mktemp)"
   http_code="$(
-    /opt/molecule-venv/bin/python3 -c "import json,sys; sys.stdout.write(json.dumps({'client_id': '$CLIENT_ID', 'grant_type': 'refresh_token', 'refresh_token': sys.argv[1]}))" "$refresh_token" \
+    "$PYTHON_BIN" -c "import json,sys; sys.stdout.write(json.dumps({'client_id': '$CLIENT_ID', 'grant_type': 'refresh_token', 'refresh_token': sys.argv[1]}))" "$refresh_token" \
       | curl -sS --max-time 30 \
             -H "Content-Type: application/json" \
             -X POST -d @- \
@@ -388,7 +402,7 @@ PY
         log "refresh: ok (http=$http_code)"
         # Re-read the freshly written file for the sidecar.
         local last_iso age
-        read -r last_iso age <<<"$(/opt/molecule-venv/bin/python3 - "$AUTH_JSON" <<'PY'
+        read -r last_iso age <<<"$("$PYTHON_BIN" - "$AUTH_JSON" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 blob = json.load(open(sys.argv[1]))

@@ -32,19 +32,13 @@ import pytest
 # Path to the script under test.
 _SCRIPT = Path(__file__).resolve().parent.parent / "codex_auth_refresh.sh"
 
-# The script hardcodes /opt/molecule-venv/bin/python3. In CI runners
-# that path doesn't exist, so we patch the script copy for tests.
+# The script now resolves python3 portably via `command -v python3`,
+# with a CODEX_PYTHON override for test rigs that want to force a
+# specific interpreter (e.g., a venv interpreter that matches the test
+# process). We pass the active interpreter explicitly so the inline
+# heredocs run under the same Python the test harness uses — important
+# when the runner's system python3 differs from the venv python.
 _REAL_PY = sys.executable
-
-
-def _patch_script_python(dst_dir: Path) -> Path:
-    """Copy the script to dst_dir, replacing the hardcoded python path."""
-    src = _SCRIPT.read_text(encoding="utf-8")
-    src = src.replace("/opt/molecule-venv/bin/python3", _REAL_PY)
-    out = dst_dir / "codex_auth_refresh.sh"
-    out.write_text(src, encoding="utf-8")
-    out.chmod(0o755)
-    return out
 
 
 def _make_jwt(claims: Dict) -> str:
@@ -138,6 +132,11 @@ def _run_once(
         **os.environ,
         "CODEX_HOME": str(codex_home),
         "HOME": str(codex_home.parent),
+        # Force the watchdog's inline-python helpers to use the same
+        # interpreter as the test harness so tests don't depend on
+        # whatever `command -v python3` happens to resolve to on the
+        # CI runner.
+        "CODEX_PYTHON": _REAL_PY,
         # Short timeouts so the test suite runs in seconds, not hours.
         "CODEX_AUTH_REFRESH_INTERVAL_SECONDS": "30",
         "CODEX_AUTH_SAFETY_MARGIN_SECONDS": "14400",
@@ -145,9 +144,8 @@ def _run_once(
     }
     if extra_env:
         env.update(extra_env)
-    script = _patch_script_python(codex_home.parent)
     return subprocess.run(
-        ["bash", str(script), "--once"],
+        ["bash", str(_SCRIPT), "--once"],
         env=env,
         capture_output=True,
         text=True,
@@ -166,6 +164,50 @@ def _assert_no_token_in_output(result: subprocess.CompletedProcess) -> None:
         assert sentinel not in combined, (
             f"watchdog leaked token sentinel {sentinel!r} into output"
         )
+
+
+def test_script_does_not_exit_127_with_portable_python_path(tmp_path: Path) -> None:
+    """Regression pin for the PR#19 → PR#24 chain: the watchdog hardcoded
+    /opt/molecule-venv/bin/python3 which does not exist in the codex
+    image (built FROM python:3.11-slim; python3 lives at
+    /usr/local/bin/python3). Every helper invocation exited 127 → OAuth
+    refresh never fired → id_token expired silently → Researcher wedged
+    (ae2c3012 diagnosis). The portable-python-path fix means the script
+    must NEVER exit 127, even with no CODEX_PYTHON override and an
+    absent auth.json. If this test fails the image is shipping broken
+    OAuth refresh again.
+    """
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    # Deliberately omit CODEX_PYTHON so the test exercises the same
+    # auto-detect path the production image relies on.
+    env = {
+        **os.environ,
+        "CODEX_HOME": str(codex_home),
+        "HOME": str(codex_home.parent),
+    }
+    # Strip CODEX_PYTHON from any inherited environment so this test
+    # genuinely exercises `command -v python3`.
+    env.pop("CODEX_PYTHON", None)
+    result = subprocess.run(
+        ["bash", str(_SCRIPT), "--once"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 127, (
+        "codex_auth_refresh.sh exited 127 — python3 helper not located. "
+        f"stderr={result.stderr!r}"
+    )
+    # No auth.json present → expect the skip path (rc=1) plus the
+    # specific skip log line. This also confirms the script actually
+    # executed past the python-resolve step into the main flow.
+    assert result.returncode == 1, (
+        f"expected skip rc=1 with no auth.json; got rc={result.returncode}\n"
+        f"stderr={result.stderr}"
+    )
+    assert "absent or empty" in result.stderr
 
 
 def test_skip_when_auth_json_absent(tmp_path: Path) -> None:
