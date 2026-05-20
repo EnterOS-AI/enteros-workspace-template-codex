@@ -444,3 +444,133 @@ async def test_thread_start_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(asyncio.TimeoutError):
         await ex._run_turn("hi")
+
+
+# ----------------------------------------------------------------------
+# Phase 1 file-only message support (a1ea2200 archaeology)
+#
+# chloe-dong canary 2026-05-20 01:04:27Z local time: PDF-only message
+# returned opaque "(empty prompt — nothing to do)". The fix relaxes the
+# empty-prompt guard so a file-only message synthesizes a prompt instead
+# of short-circuiting, and the truly-empty case surfaces an actionable
+# reason per feedback_surface_actionable_failure_reason_to_user.
+# ----------------------------------------------------------------------
+
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+
+def _ctx_with_parts(parts: list) -> SimpleNamespace:
+    """Build a minimal RequestContext stub the executor reads from.
+
+    Only ``context.message.parts`` is touched by the guard path under
+    test, so the surrounding object can stay light.
+    """
+    msg = SimpleNamespace(parts=parts, task_id=None, context_id=None)
+    return SimpleNamespace(message=msg, task_id=None, session_id=None, context_id=None)
+
+
+def _text_part(text: str) -> SimpleNamespace:
+    return SimpleNamespace(kind="text", text=text)
+
+
+def _file_part(*, name: str, mime_type: str, path: str) -> SimpleNamespace:
+    """Build a v0-flat FilePart-shaped object.
+
+    ``extract_attached_files`` calls ``resolve_attachment_uri`` which
+    requires the uri to point at an existing file on disk — tests pass a
+    real tmp_path.
+    """
+    file_obj = SimpleNamespace(uri=f"file://{path}", name=name, mimeType=mime_type)
+    return SimpleNamespace(kind="file", file=file_obj)
+
+
+class _CapturingQueue:
+    def __init__(self) -> None:
+        self.events: list = []
+
+    async def enqueue_event(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.events.append(event)
+
+
+@pytest.mark.asyncio
+async def test_execute_file_only_no_longer_returns_opaque_empty(
+    tmp_path, monkeypatch
+) -> None:
+    """File-only message must not short-circuit with the opaque
+    '(empty prompt — nothing to do)' string."""
+    # extract_attached_files / resolve_attachment_uri refuse paths
+    # outside WORKSPACE_MOUNT. Point that at the test's tmp_path so the
+    # helper accepts our fixture file.
+    import molecule_runtime.executor_helpers as _helpers
+    monkeypatch.setattr(_helpers, "WORKSPACE_MOUNT", str(tmp_path))
+
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    pdf = tmp_path / "chloe.pdf"
+    pdf.write_bytes(b"%PDF-1.4 stub\n")
+
+    ctx = _ctx_with_parts([
+        _file_part(name="chloe.pdf", mime_type="application/pdf", path=str(pdf)),
+    ])
+    queue = _CapturingQueue()
+
+    captured_prompts: list[str] = []
+
+    async def fake_run_turn(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return "ack"
+
+    ex._run_turn = fake_run_turn  # type: ignore[assignment,method-assign]
+    await ex.execute(ctx, queue)
+
+    # Either the synthesized prompt landed in _run_turn OR the reply
+    # event went out — never the opaque empty-prompt string.
+    blob = repr(queue.events) + repr(captured_prompts)
+    assert "empty prompt — nothing to do" not in blob
+    # Prompt must mention the file name so codex can act on it.
+    assert any("chloe.pdf" in p for p in captured_prompts)
+
+
+@pytest.mark.asyncio
+async def test_execute_truly_empty_surfaces_actionable_reason() -> None:
+    """Empty text AND no files → actionable user-facing reason, NOT
+    opaque error type."""
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    ctx = _ctx_with_parts([_text_part("   ")])
+    queue = _CapturingQueue()
+
+    await ex.execute(ctx, queue)
+
+    assert len(queue.events) == 1
+    msg_repr = repr(queue.events[0])
+    assert "Your message was empty" in msg_repr
+    assert "send text or a file" in msg_repr
+    # The old opaque string must NOT appear.
+    assert "(empty prompt — nothing to do)" not in msg_repr
+
+
+@pytest.mark.asyncio
+async def test_execute_text_only_still_passes_prompt_unchanged() -> None:
+    """Regression-pin: text-only messages keep working exactly as
+    before — the file-aware branch must not perturb the text path."""
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    ctx = _ctx_with_parts([_text_part("write a haiku")])
+    queue = _CapturingQueue()
+
+    captured_prompts: list[str] = []
+
+    async def fake_run_turn(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return "ok"
+
+    ex._run_turn = fake_run_turn  # type: ignore[assignment,method-assign]
+    await ex.execute(ctx, queue)
+
+    assert captured_prompts == ["write a haiku"]
