@@ -87,7 +87,16 @@ jobs:
     # molecule-core docker build/push job (publish-workspace-server-image
     # .yml / publish-runtime.yml / publish-canvas-image.yml: `runs-on:
     # publish`).
-    runs-on: publish
+    # AND-of-labels: `publish` is also advertised by some
+    # hongming-pc-runner-publish-* runners (Windows), whose runner-base
+    # image (`docker-config-fix`) breaks `docker login --password-stdin`
+    # with `Error saving credentials: mkdir /home/hongming: permission
+    # denied` (task #280 close-out, 2026-05-19 publish-image run 79 job 1).
+    # op-host molecule-runner-publish-{1,2} are the only runners advertising
+    # BOTH `publish` AND `release` (op-host /opt/molecule/runners/
+    # config.publish.yaml lines 28-29). Requiring both labels routes
+    # publish to op-host deterministically.
+    runs-on: [publish, release]
     timeout-minutes: 30
     needs: resolve-version
     steps:
