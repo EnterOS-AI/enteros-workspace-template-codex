@@ -47,6 +47,7 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 # Defense-in-depth on GITHUB_TOKEN scope. validate-runtime +
 # t4-conformance run untrusted-by-design code (pip-install, adapter
@@ -65,9 +66,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       # Secret scan — most important check. Always runs, including on
       # fork PRs (no third-party code executes here).
       - name: Check for secrets
@@ -146,11 +144,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
       - run: pip install pyyaml -q
       - if: hashFiles('requirements.txt') != ''
         run: pip install -q -r requirements.txt
@@ -348,9 +341,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       - run: pip install -q pytest pytest-asyncio pyyaml
       # Tests under tests/ exercise the executor turn lifecycle +
       # app_server JSON-RPC plumbing against a mock codex binary; they
