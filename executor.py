@@ -431,7 +431,12 @@ class CodexAppServerExecutor(AgentExecutor):
                 # when we missed a delta chunk. Idempotent dedupe so a
                 # streaming turn doesn't double the text.
                 item = params.get("item") or {}
-                if item.get("type") in ("agent_message", "assistant_message"):
+                if item.get("type") in (
+                    "agent_message",
+                    "assistant_message",
+                    "agentMessage",
+                    "assistantMessage",
+                ):
                     whole = item.get("message") or item.get("text") or ""
                     if whole and whole not in state.deltas:
                         state.deltas.append(whole)
