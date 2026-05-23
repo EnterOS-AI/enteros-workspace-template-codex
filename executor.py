@@ -111,6 +111,7 @@ class CodexAppServerExecutor(AgentExecutor):
         # Tracked so cancel() can fire turn/interrupt against the
         # currently-running turn (best-effort).
         self._current_turn_id: str | None = None
+        self._pending_attached_files: list[dict[str, str]] = []
 
     # ------------------------------------------------------------------
     # Bootstrap
@@ -247,7 +248,7 @@ class CodexAppServerExecutor(AgentExecutor):
                     "turn/steer",
                     {
                         "threadId": self._thread_id,
-                        "input": [{"type": "text", "text": prompt}],
+                        "input": self._build_turn_input(prompt, attached),
                         "expectedTurnId": self._current_turn_id,
                     },
                     timeout=5.0,
@@ -282,6 +283,7 @@ class CodexAppServerExecutor(AgentExecutor):
 
         async with self._turn_lock:
             try:
+                self._pending_attached_files = attached
                 text = await self._run_turn(prompt)
             except AppServerError as exc:
                 logger.warning("codex app-server error: %s", exc)
@@ -320,6 +322,8 @@ class CodexAppServerExecutor(AgentExecutor):
                     new_text_message(f"[codex error] {exc}")
                 )
                 return
+            finally:
+                self._pending_attached_files = []
 
         await event_queue.enqueue_event(new_text_message(text))
 
@@ -497,7 +501,7 @@ class CodexAppServerExecutor(AgentExecutor):
         try:
             resp = await self._app_server.request("turn/start", {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt}],
+                "input": self._build_turn_input(prompt, self._pending_attached_files),
             })
             # Mirror the same id/threadId tolerance we have for thread/start.
             turn = resp.get("turn") or {}
@@ -516,6 +520,18 @@ class CodexAppServerExecutor(AgentExecutor):
         if state.error:
             raise state.error
         return "".join(state.deltas)
+
+    def _build_turn_input(
+        self,
+        prompt: str,
+        attached: list[dict[str, str]] | None = None,
+    ) -> list[dict[str, str]]:
+        """Build codex app-server input items from text plus image attachments."""
+        items: list[dict[str, str]] = [{"type": "text", "text": prompt}]
+        for file in attached or []:
+            if (file.get("mime_type") or "").startswith("image/") and file.get("path"):
+                items.append({"type": "localImage", "path": file["path"]})
+        return items
 
     async def _await_turn_completion(self, state: _TurnState) -> None:
         """Wait for turn completion with two stacked timeouts.
