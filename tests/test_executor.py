@@ -216,6 +216,27 @@ async def test_run_turn_reuses_thread_on_second_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_turn_accepts_codex_0130_completed_agent_message_item() -> None:
+    """Codex 0.130 emits completed assistant items with camelCase types."""
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push(
+            "item/completed",
+            {"item": {"type": "agentMessage", "message": "whole response"}},
+        )
+        fake.push("turn/completed")
+
+    driver_task = asyncio.create_task(driver())
+    text = await ex._run_turn("hi")
+    await driver_task
+
+    assert text == "whole response"
+
+
+@pytest.mark.asyncio
 async def test_run_turn_surfaces_error_notification() -> None:
     fake = FakeAppServer()
     ex = _make_executor(fake)
