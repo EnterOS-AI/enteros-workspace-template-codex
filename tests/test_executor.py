@@ -247,7 +247,7 @@ async def test_thread_start_passes_config() -> None:
     assert thread_start["model"] == "o4-mini"
     assert thread_start["developerInstructions"] == "custom prompt"
     assert thread_start["approvalPolicy"] == "never"
-    assert thread_start["sandboxPolicy"] == {"mode": "workspace-write"}
+    assert thread_start["sandboxPolicy"] == {"mode": "danger-full-access"}
 
 
 @pytest.mark.asyncio
@@ -532,6 +532,40 @@ async def test_execute_file_only_no_longer_returns_opaque_empty(
     assert "empty prompt — nothing to do" not in blob
     # Prompt must mention the file name so codex can act on it.
     assert any("chloe.pdf" in p for p in captured_prompts)
+
+
+@pytest.mark.asyncio
+async def test_execute_image_attachment_becomes_local_image_input(
+    tmp_path, monkeypatch
+) -> None:
+    """PNG file parts must reach codex app-server as localImage items."""
+    import molecule_runtime.executor_helpers as _helpers
+    monkeypatch.setattr(_helpers, "WORKSPACE_MOUNT", str(tmp_path))
+
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    png = tmp_path / "shape-probe.png"
+    png.write_bytes(b"png")
+    ctx = _ctx_with_parts([
+        _text_part("describe the image"),
+        _file_part(name="shape-probe.png", mime_type="image/png", path=str(png)),
+    ])
+    queue = _CapturingQueue()
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push_delta("red square")
+        fake.push_task_complete()
+
+    driver_task = asyncio.create_task(driver())
+    await ex.execute(ctx, queue)
+    await driver_task
+
+    turn_start = [p for m, p in fake.requests if m == "turn/start"][-1]
+    assert turn_start["input"][0]["type"] == "text"
+    assert "shape-probe.png" in turn_start["input"][0]["text"]
+    assert {"type": "localImage", "path": str(png)} in turn_start["input"]
 
 
 @pytest.mark.asyncio
