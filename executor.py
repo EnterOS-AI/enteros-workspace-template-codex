@@ -145,10 +145,33 @@ class CodexAppServerExecutor(AgentExecutor):
             if self._config.system_prompt:
                 params["developerInstructions"] = self._config.system_prompt
             # Workspace agents can't prompt a human, so approval policy
-            # must be `never`. Sandbox `workspace-write` lets the agent
-            # edit the workspace tree but not arbitrary disk.
+            # must be `never`.
+            #
+            # Sandbox mode: `danger-full-access` (no bwrap at all).
+            #
+            # Why not `workspace-write` + `network_access: True`?
+            # That config is the correct one philosophically, but on
+            # the deployed codex-cli 0.130.0 binary it tries to bring
+            # up a private network namespace via bwrap `--unshare-net`,
+            # which fails inside our docker container with
+            #   `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`
+            # because the container doesn't carry `CAP_NET_ADMIN`. The
+            # capability could be granted via docker `--cap-add NET_ADMIN`
+            # in the provisioner, but that's a controlplane-side change.
+            #
+            # Until the provisioner adds the capability, sandboxPolicy
+            # `danger-full-access` bypasses bwrap entirely → no netns
+            # setup → network works → agent can `git clone` / `curl`
+            # Gitea + GitHub for PR review and code fetches. The
+            # workspace agent runs as uid-1000 inside a per-tenant EC2
+            # so blast radius is bounded to the workspace's own
+            # filesystem + that one EC2's network identity.
+            #
+            # Tracked: file follow-up in molecule-controlplane to add
+            # NET_ADMIN to the codex container run args, then revert
+            # this to workspace-write + network_access:True.
             params["approvalPolicy"] = "never"
-            params["sandboxPolicy"] = {"mode": "workspace-write"}
+            params["sandboxPolicy"] = {"mode": "danger-full-access"}
 
             resp = await self._app_server.request(
                 "thread/start", params, timeout=_THREAD_START_TIMEOUT,
@@ -342,27 +365,27 @@ class CodexAppServerExecutor(AgentExecutor):
         loop = asyncio.get_running_loop()
 
         def on_notification(method: str, params: dict[str, Any]) -> None:
-            # Codex 0.72 wraps all event notifications under a single
-            # `codex/event/<type>` JSON-RPC method, with the actual
-            # event under `params.msg` and `params.msg.type` carrying
-            # the event-type tag. There's a parallel set of bare
-            # methods (`item/started`, `turn/started`, `error`) that
-            # mirror a subset for legacy clients — we ignore those
-            # and read the canonical `codex/event/*` stream.
+            # Codex emits notifications in two schemas the executor must
+            # handle simultaneously — the deployed CLI version changed
+            # the wire protocol without bumping the JSON-RPC version, so
+            # both formats appear in production.
             #
-            # Captured live by running `codex app-server` directly
-            # against a fresh thread (2026-05-03). Pre-fix the
-            # executor matched on `agent_message_delta` /
-            # `turn/completed` directly as the JSON-RPC method, which
-            # never fires in codex 0.72 — every probe returned empty
-            # text + the workspace looked healthy.
+            # **codex 0.72 (legacy)** — single namespace `codex/event/<type>`
+            # JSON-RPC method, event payload under `params.msg` and
+            # `params.msg.type` carrying the event-type tag.
             #
-            # Surfaced events (msg.type values):
-            #   - agent_message_delta — streamed chunk (delta)
-            #   - agent_message       — whole reply (when model didn't stream)
-            #   - task_complete       — turn finished cleanly
-            #   - error               — fatal turn error
-            # Reasoning / item / tool events are debug-logged.
+            # **codex 0.130 (current deployed binary)** — top-level method
+            # names: `item/agentMessage/delta`, `item/completed`,
+            # `turn/completed`, `thread/started`, etc. Verified live via
+            # container-side instrumentation 2026-05-22 against
+            # codex-cli 0.130.0 deployed image: turns completed cleanly
+            # at the codex side (delta + completed + turn/completed all
+            # fired), but the executor matched none of the 0.130 method
+            # names so `state.deltas` stayed empty and
+            # `state.completed.set()` was never called. The inactivity
+            # watchdog then fired 90s after codex's last notification,
+            # producing the "wedged: no events for 90s (deltas=0)"
+            # symptom even though codex delivered the response.
             #
             # Activity bump: every notification (matched or unmatched)
             # is the heartbeat for the inactivity watchdog. We bump
@@ -381,6 +404,49 @@ class CodexAppServerExecutor(AgentExecutor):
                         str(err.get("message") or "unknown codex error")
                     )
                     loop.call_soon_threadsafe(state.completed.set)
+                return
+
+            # codex 0.130 schema — top-level methods. Handled BEFORE the
+            # `codex/event/` filter so they take priority on the deployed
+            # binary; the 0.72 fallback below remains for any future
+            # downgrade or vendor variant that re-emits the old shape.
+            if method == "item/agentMessage/delta":
+                # Delta text under `params.delta` per codex-rs/app-server
+                # schema; fall back to `params.text` for variants and to
+                # the `params.item` envelope some 0.130.x patch releases
+                # used while the schema was settling.
+                delta = (
+                    params.get("delta")
+                    or params.get("text")
+                    or (params.get("item") or {}).get("delta")
+                    or (params.get("item") or {}).get("text")
+                    or ""
+                )
+                if delta:
+                    state.deltas.append(delta)
+                return
+            if method == "item/completed":
+                # Final assembled message — recover the full text when
+                # delta streaming was skipped (non-OpenAI backends) or
+                # when we missed a delta chunk. Idempotent dedupe so a
+                # streaming turn doesn't double the text.
+                item = params.get("item") or {}
+                if item.get("type") in ("agent_message", "assistant_message"):
+                    whole = item.get("message") or item.get("text") or ""
+                    if whole and whole not in state.deltas:
+                        state.deltas.append(whole)
+                return
+            if method == "turn/completed":
+                # 0.130's equivalent of `task_complete`. Codex emits
+                # this AFTER the last `item/completed`, so by the time
+                # we set state.completed.set the deltas list is already
+                # populated. If the streaming missed entirely and we
+                # have no deltas, `last_agent_message` (when present
+                # in params) is the recovery.
+                last = params.get("last_agent_message") or params.get("message") or ""
+                if last and last not in state.deltas:
+                    state.deltas.append(last)
+                loop.call_soon_threadsafe(state.completed.set)
                 return
 
             if not method.startswith("codex/event/"):
