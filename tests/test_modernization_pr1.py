@@ -222,6 +222,29 @@ async def test_setup_passes_for_real_model_id(_adapter, monkeypatch, tmp_path):
     ))
 
 
+@pytest.mark.asyncio
+async def test_setup_ignores_legacy_model_provider_model_id(
+    _adapter, monkeypatch, tmp_path,
+):
+    """Old controlplane images may still export MODEL_PROVIDER=<model id>.
+    Codex uses MODEL_PROVIDER as an explicit provider override, so setup
+    must ignore values that are not provider registry names and fall back
+    to normal credential-based provider resolution."""
+    if not shutil.which("codex"):
+        pytest.skip("codex binary not on PATH (container-only check)")
+    _clear_creds(monkeypatch)
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    (codex_home / "auth.json").write_text('{"auth_mode":"chatgpt"}')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("MODEL_PROVIDER", "gpt-5.5")
+    from molecule_runtime.adapters.base import AdapterConfig
+    await _adapter.setup(AdapterConfig(
+        model="gpt-5.5",
+        runtime_config={"model": "gpt-5.5"},
+    ))
+
+
 # --- Group 3: start.sh mode-C structural behavior --------------------------
 # We can't run the full start.sh (it execs molecule-runtime). Instead we
 # extract the mode-C block and run it in isolation with a fake HOME, then
