@@ -155,12 +155,6 @@ class CodexAdapter(BaseAdapter):
             yaml_model = getattr(rc, "model", None) or getattr(config, "model", "") or ""
             yaml_provider = getattr(rc, "provider", None) or ""
 
-        # MODEL_PROVIDER env from the persona-env layer (if any) wins
-        # over YAML when set — mirrors the claude-code template's
-        # _resolve_model_and_provider_from_env shape.
-        env_provider = (os.environ.get("MODEL_PROVIDER") or "").strip()
-        explicit_provider = env_provider or yaml_provider or None
-
         try:
             from provider_config import (
                 assert_model_is_not_provider_name,
@@ -182,6 +176,26 @@ class CodexAdapter(BaseAdapter):
         providers = load_providers(
             workspace_config_path=getattr(config, "config_path", "") or "",
         )
+
+        # MODEL_PROVIDER is historically overloaded in the platform
+        # stack: old provisioners used it for a model id, while newer
+        # config paths use it for a provider name. Treat it as explicit
+        # only when it names a provider the registry actually accepts.
+        # A leaked value like "gpt-5.5" must not override the
+        # subscription auto-detection path.
+        env_provider = (os.environ.get("MODEL_PROVIDER") or "").strip()
+        provider_names = {p["name"].lower() for p in providers}
+        if env_provider and env_provider.lower() in provider_names:
+            explicit_provider = env_provider
+        elif env_provider:
+            explicit_provider = yaml_provider or None
+            logger.warning(
+                "codex adapter: ignoring legacy MODEL_PROVIDER=%r because "
+                "it is not a provider registry name",
+                env_provider,
+            )
+        else:
+            explicit_provider = yaml_provider or None
 
         # Defense-in-depth for the CP workspace-config writer bug
         # (2026-05-18 Reviewer + Researcher wedge): if the upstream
