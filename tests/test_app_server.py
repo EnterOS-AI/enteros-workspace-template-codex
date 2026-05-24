@@ -71,6 +71,83 @@ async def test_notify_writes_no_id_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inbound_elicitation_request_auto_accepted() -> None:
+    """Server-initiated `mcpServer/elicitation/request` must auto-accept.
+
+    Codex 0.130 sends this method to ask permission for MCP tool calls.
+    Without a response, the active turn wedges and times out at 600s with
+    `codex turn ... wedged: no events for 90s` — the post-PR#48 symptom
+    observed live on CR2 + Researcher 2026-05-24. Regression guard.
+    """
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        # Ask the mock to send a server→client elicitation request.
+        resp = await proc.request("send_inbound_request", {
+            "req_method": "mcpServer/elicitation/request",
+            "req_id": 12345,
+            "req_params": {
+                "threadId": "test-thread",
+                "turnId": "test-turn",
+                "serverName": "molecule",
+                "mode": "form",
+                "message": "Allow tool inbox_peek?",
+                "_meta": {"codex_approval_kind": "mcp_tool_call"},
+            },
+        })
+        # Client should have answered with action=accept (default policy).
+        client_response = resp["client_response"]
+        assert client_response == {"action": "accept", "content": {}}, (
+            f"expected auto-accept, got {client_response!r}"
+        )
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_unknown_request_auto_declined() -> None:
+    """Unknown inbound request methods must auto-decline (not hang)."""
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        resp = await proc.request("send_inbound_request", {
+            "req_method": "some/unknown/method",
+            "req_id": 99001,
+            "req_params": {},
+        })
+        # Default policy: decline, content=None.
+        assert resp["client_response"] == {"action": "decline", "content": None}
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_request_handler_override() -> None:
+    """Caller can register a custom handler that overrides default policy."""
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        seen_params: dict = {}
+
+        async def handler(method: str, params: dict) -> dict:
+            seen_params["method"] = method
+            seen_params["params"] = params
+            return {"action": "accept", "content": {"custom": True}}
+
+        proc.set_inbound_request_handler("mcpServer/elicitation/request", handler)
+        resp = await proc.request("send_inbound_request", {
+            "req_method": "mcpServer/elicitation/request",
+            "req_id": 88001,
+            "req_params": {"hello": "world"},
+        })
+        assert seen_params["method"] == "mcpServer/elicitation/request"
+        assert seen_params["params"] == {"hello": "world"}
+        assert resp["client_response"] == {"action": "accept", "content": {"custom": True}}
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
 async def test_request_response_correlation() -> None:
     """Concurrent requests should not cross responses."""
     proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))

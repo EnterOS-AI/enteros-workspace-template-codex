@@ -50,6 +50,12 @@ def _write(obj: dict) -> None:
 # `initialized` notification after `initialize`.
 _received_notifications: list[str] = []
 
+# Pending server-initiated requests: maps request_id -> future that the
+# read loop resolves with the client's response payload. Used by the
+# `send_inbound_request` test helper to round-trip a server→client→server
+# request/response pair under test.
+_pending_inbound: dict = {}
+
 
 async def _handle(msg: dict) -> None:
     method = msg.get("method")
@@ -99,6 +105,40 @@ async def _handle(msg: dict) -> None:
                 "code": int(params.get("code", -32000)),
                 "message": str(params.get("message", "mock error")),
             },
+        })
+        return
+
+    if method == "send_inbound_request":
+        # Server-initiated request — fire it at the client + wait for a
+        # response on a NEW request_id we control. Used to test
+        # set_inbound_request_handler / default policy / elicitation
+        # auto-accept behavior in app_server.AppServerProcess._dispatch.
+        #
+        # params: {req_method, req_id, req_params}
+        req_method = str(params.get("req_method", "test/echo"))
+        req_id = int(params.get("req_id", 99999))
+        req_params = params.get("req_params") or {}
+        # Register an event so the test can find the client's response.
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        _pending_inbound[req_id] = fut
+        _write({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": req_method,
+            "params": req_params,
+        })
+        # Wait briefly for the client to respond; relay the response in our
+        # OWN reply so the test can assert on it.
+        try:
+            client_response = await asyncio.wait_for(fut, timeout=2.0)
+        except asyncio.TimeoutError:
+            client_response = {"timeout": True}
+        finally:
+            _pending_inbound.pop(req_id, None)
+        _write({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"client_response": client_response},
         })
         return
 
@@ -188,6 +228,21 @@ async def main() -> None:
         # `await` before the append in _handle.
         if msg.get("id") is None and isinstance(msg.get("method"), str):
             _received_notifications.append(msg["method"])
+        # Client response to a server-initiated request we sent earlier?
+        # (response has id + (result or error) and no method.) Route to
+        # the waiting future so send_inbound_request can return it.
+        if (
+            "id" in msg
+            and "method" not in msg
+            and ("result" in msg or "error" in msg)
+        ):
+            fut = _pending_inbound.get(msg["id"])
+            if fut is not None and not fut.done():
+                if "error" in msg:
+                    fut.set_result({"error": msg["error"]})
+                else:
+                    fut.set_result(msg.get("result"))
+                continue
         # Schedule handling so `emit` doesn't block subsequent reads.
         asyncio.create_task(_handle(msg))
 

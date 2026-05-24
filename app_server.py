@@ -73,6 +73,7 @@ _DEFAULT_REQUEST_TIMEOUT = 600.0
 _SHUTDOWN_TIMEOUT = 5.0
 
 NotificationCallback = Callable[[str, dict[str, Any]], None]
+InboundRequestHandler = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 
 class AppServerError(RuntimeError):
@@ -118,6 +119,12 @@ class AppServerProcess:
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._subscribers: list[NotificationCallback] = []
+        # Caller-registered handlers for server-initiated requests
+        # (e.g. mcpServer/elicitation/request). Maps method name to an
+        # async callable that returns the JSON-RPC result payload.
+        # Unhandled methods fall through to the default policy in
+        # ``_dispatch``.
+        self._inbound_handlers: dict[str, InboundRequestHandler] = {}
         self._write_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -284,6 +291,28 @@ class AppServerProcess:
                 pass
 
         return unsubscribe
+
+    def set_inbound_request_handler(
+        self, method: str, handler: InboundRequestHandler | None
+    ) -> None:
+        """Register/clear a handler for a server-initiated request method.
+
+        Codex's app-server can send JSON-RPC requests to the client
+        (e.g. `mcpServer/elicitation/request`). Without a handler, the
+        request hangs the active turn until codex's 90-second
+        per-event watchdog fires and fails the turn.
+
+        Handler is an async callable `(method, params) -> result`. Its
+        return value becomes the `result` of the JSON-RPC response.
+        Exceptions are caught and surfaced as JSON-RPC error -32000.
+
+        Pass `handler=None` to remove a previously-registered handler;
+        the default policy in ``_dispatch`` then applies.
+        """
+        if handler is None:
+            self._inbound_handlers.pop(method, None)
+        else:
+            self._inbound_handlers[method] = handler
 
     async def close(self) -> int | None:
         """Close stdio, wait for child exit, return its exit code.
@@ -472,4 +501,63 @@ class AppServerProcess:
                     logger.exception("notification subscriber raised on %r", method)
             return
 
+        # Server-initiated request (has method, has id). Codex 0.130 uses
+        # this for MCP-server elicitations: when a thread wants to call a
+        # tool on a configured MCP server, the app-server sends
+        # `mcpServer/elicitation/request` and waits up to 90s for the
+        # client to answer with `{action: "accept"|"decline"|"cancel"}`.
+        # Without a response, the turn wedges and times out at 600s with
+        # `codex turn 019e... wedged: no events for 90s` — exactly the
+        # post-PR#48 symptom observed on CR2 + Researcher 2026-05-24.
+        #
+        # For our agents the MCP server is the in-process `molecule`
+        # adapter — we wrote it, we trust it, every call should be
+        # auto-accepted. Future per-method policy can be plugged via
+        # ``set_inbound_request_handler``.
+        if "method" in msg and "id" in msg:
+            method = msg["method"]
+            request_id = msg["id"]
+            handler = self._inbound_handlers.get(method)
+            if handler is not None:
+                # Caller-provided handler: schedule + send its result.
+                asyncio.create_task(self._run_inbound_handler(handler, msg))
+                return
+            # Default behavior: auto-accept MCP elicitation requests;
+            # log + decline anything else so the turn doesn't hang.
+            if method == "mcpServer/elicitation/request":
+                response = {"action": "accept", "content": {}}
+            else:
+                logger.warning(
+                    "no handler for inbound request %r; auto-declining", method
+                )
+                response = {"action": "decline", "content": None}
+            asyncio.create_task(
+                self._write_message(
+                    {"jsonrpc": "2.0", "id": request_id, "result": response}
+                )
+            )
+            return
+
         logger.warning("unrecognized message from app-server: %r", msg)
+
+    async def _run_inbound_handler(
+        self, handler: "InboundRequestHandler", msg: dict[str, Any]
+    ) -> None:
+        """Invoke a caller-registered inbound-request handler + send response."""
+        request_id = msg["id"]
+        method = msg["method"]
+        params = msg.get("params") or {}
+        try:
+            result = await handler(method, params)
+            await self._write_message(
+                {"jsonrpc": "2.0", "id": request_id, "result": result}
+            )
+        except Exception as exc:
+            logger.exception("inbound request handler raised on %r", method)
+            await self._write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32000, "message": str(exc)},
+                }
+            )
