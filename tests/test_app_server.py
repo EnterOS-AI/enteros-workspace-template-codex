@@ -35,6 +35,42 @@ async def test_initialize_handshake() -> None:
 
 
 @pytest.mark.asyncio
+async def test_initialize_sends_initialized_notification() -> None:
+    """``initialize`` must be followed by an ``initialized`` notification.
+
+    Per codex app-server protocol contract — without this notification,
+    codex 0.130+ silently rejects every subsequent request with
+    "Not initialized". Regression guard for internal#659 P1#1.
+    """
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        # Ask the mock what notifications it received from us.
+        seen = await proc.request("get_received_notifications", {})
+        assert "initialized" in seen["methods"], (
+            f"client did not send `initialized` notification; mock saw: {seen['methods']}"
+        )
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_writes_no_id_message() -> None:
+    """``notify`` must produce a JSON-RPC message with no ``id`` field."""
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        # Send a custom notification; mock records it.
+        await proc.notify("custom_event", {"x": 1})
+        seen = await proc.request("get_received_notifications", {})
+        # `initialized` (auto-sent) + `custom_event` (manual) should both be present.
+        assert "initialized" in seen["methods"]
+        assert "custom_event" in seen["methods"]
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
 async def test_request_response_correlation() -> None:
     """Concurrent requests should not cross responses."""
     proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))

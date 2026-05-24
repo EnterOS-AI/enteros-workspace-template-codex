@@ -44,13 +44,32 @@ def _write(obj: dict) -> None:
     sys.stdout.flush()
 
 
+# Server-side log of notifications the client sent us, in arrival order.
+# Tests can read this back via the `get_received_notifications` RPC to
+# assert that the client honored protocol contracts like sending an
+# `initialized` notification after `initialize`.
+_received_notifications: list[str] = []
+
+
 async def _handle(msg: dict) -> None:
     method = msg.get("method")
     params = msg.get("params") or {}
     request_id = msg.get("id")
 
-    # Notifications (no id) are ignored by the mock.
+    # Notifications are recorded synchronously in main() before dispatch
+    # (see the read loop below) so ordering vs. subsequent request handlers
+    # is guaranteed by the read loop itself, not by task-FIFO scheduling.
     if request_id is None:
+        return
+
+    if method == "get_received_notifications":
+        # Test-only introspection RPC: returns the list of notification
+        # methods we've seen so far. Not part of the real codex protocol.
+        _write({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"methods": list(_received_notifications)},
+        })
         return
 
     if method == "initialize":
@@ -160,6 +179,15 @@ async def main() -> None:
             msg = json.loads(line.decode("utf-8"))
         except json.JSONDecodeError:
             continue
+        # Record notifications synchronously here so a subsequent request
+        # observing _received_notifications cannot race the notification's
+        # handler task. The handler still runs (no-op for notifications)
+        # but the visible-state mutation is ordered by the read loop, not
+        # by task FIFO. Without this, the test_initialize_sends_initialized_
+        # notification assertion would flake the moment anyone added an
+        # `await` before the append in _handle.
+        if msg.get("id") is None and isinstance(msg.get("method"), str):
+            _received_notifications.append(msg["method"])
         # Schedule handling so `emit` doesn't block subsequent reads.
         asyncio.create_task(_handle(msg))
 

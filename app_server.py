@@ -177,8 +177,43 @@ class AppServerProcess:
     # Public API
     # ------------------------------------------------------------------
     async def initialize(self, *, client_info: dict[str, Any]) -> dict[str, Any]:
-        """Send the `initialize` handshake. Must be called before other RPCs."""
-        return await self.request("initialize", {"clientInfo": client_info})
+        """Send the `initialize` handshake. Must be called before other RPCs.
+
+        Per the codex app-server protocol contract (codex-rs/app-server/README.md
+        + codex-rs/app-server-protocol/schema/json/ClientNotification.json), a
+        client MUST send an ``initialized`` notification (no id) AFTER receiving
+        the ``initialize`` response and BEFORE sending any further request.
+        Otherwise codex returns ``Not initialized`` errors on subsequent calls.
+
+        codex-cli 0.72.x was permissive about a missing ``initialized`` —
+        ``thread/start`` worked anyway. 0.130.0 (current production image) is
+        strict: every post-initialize RPC silently hangs / rejects until the
+        notification arrives. Reproduced live 2026-05-24 against
+        agents-team prod CR2 + Researcher (workspaces 4e817f43… and
+        712b5600…). See internal#659 P1#1.
+        """
+        result = await self.request("initialize", {"clientInfo": client_info})
+        # Spec requires this notification to acknowledge the initialize
+        # handshake. Without it, codex 0.130+ wedges every subsequent request.
+        await self.notify("initialized")
+        return result
+
+    async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        """Send a JSON-RPC notification (no id, no response).
+
+        Raises ConnectionError if the channel is closed or the reader
+        has marked the channel dead.
+        """
+        if self._closed:
+            raise ConnectionError("app-server is closed")
+        if self._reader_exc is not None:
+            raise ConnectionError(
+                f"app-server reader failed: {self._reader_exc!r}"
+            ) from self._reader_exc
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        await self._write_message(message)
 
     async def request(
         self,
