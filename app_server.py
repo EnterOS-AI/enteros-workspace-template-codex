@@ -139,9 +139,22 @@ class AppServerProcess:
     ) -> "AppServerProcess":
         """Spawn `codex app-server` as a stdio-piped child."""
         proc_env = {**os.environ, **(env or {})}
+        # `limit` controls the underlying asyncio.StreamReader buffer for
+        # stdout/stderr. Default is 64 KB (asyncio.streams._DEFAULT_LIMIT),
+        # which the codex app-server can exceed on a single JSON-RPC line
+        # — e.g. a Code-Reviewer agent's review payload that embeds a full
+        # PR diff. When a line is bigger than the limit, _read_loop's
+        # `async for raw in self._proc.stdout` raises
+        # `ValueError('Separator is found, but chunk is longer than limit')`
+        # (or '... not found, and chunk exceed the limit') and the reader
+        # task dies — every pending request then hangs until timeout, and
+        # CR2/Researcher become permanently unable to complete codex turns.
+        # 10 MB is well above the largest review payload observed
+        # (canvas screenshot 2026-05-23) while still bounded.
         proc = await asyncio.create_subprocess_exec(
             executable,
             *args,
+            limit=10 * 1024 * 1024,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
