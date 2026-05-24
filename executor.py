@@ -42,6 +42,11 @@ from molecule_runtime.executor_helpers import (
     extract_attached_files,
     extract_message_text,
 )
+try:
+    from molecule_runtime.attachment_vision import append_image_descriptions
+except ModuleNotFoundError:  # pragma: no cover - older local runtime
+    async def append_image_descriptions(text, files):
+        return text
 
 from app_server import AppServerError, AppServerProcess
 
@@ -204,6 +209,7 @@ class CodexAppServerExecutor(AgentExecutor):
         # file-content forwarding via codex's input parts.
         attached = extract_attached_files(context.message)
         if attached:
+            text = await append_image_descriptions(text, attached)
             manifest = "\n\nAttached files:\n" + "\n".join(
                 f"- {f['name']} ({f['mime_type'] or 'unknown type'}) at {f['path']}"
                 for f in attached
