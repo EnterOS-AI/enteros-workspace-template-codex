@@ -101,6 +101,25 @@ providers:
     model_provider_slug: minimax
     model_id_override: codex-MiniMax-M2.7
 
+  # Molecule platform-managed OpenAI via the proxy Responses surface. The
+  # adapter selects this provider when MOLECULE_LLM_BILLING_MODE=platform_managed
+  # and overrides base_url with the injected MOLECULE_LLM_BASE_URL (the static
+  # value here is the prod default). wire_api=responses — codex CLI 0.130+ is
+  # Responses-API-only; the CLI POSTs {base_url}/responses.
+  - name: platform
+    auth_mode: openai_compat_responses
+    # NO model_prefixes: the adapter selects `platform` ONLY by forcing
+    # explicit_provider="platform" under MOLECULE_LLM_BILLING_MODE=platform_managed
+    # (resolve_provider precedence #1). Leaving it prefix-unmatched fences a
+    # BYOK workspace that picked an `openai/`-prefixed id from silently
+    # resolving here + hitting the prod proxy with an unset token (mis-bill).
+    model_prefixes: []
+    model_aliases: []
+    base_url: https://api.moleculesai.app/api/v1/internal/llm/openai/v1
+    auth_env: [MOLECULE_LLM_USAGE_TOKEN, ANTHROPIC_API_KEY]
+    wire_api: responses
+    model_provider_slug: platform
+
 runtime: codex
 runtime_config:
   # Default codex model. Pass-through to `thread/start`'s `model`
@@ -151,6 +170,19 @@ runtime_config:
     - id: codex-minimax-m2.7
       name: MiniMax M2.7 codex (third-party token-plan)
       required_env: [MINIMAX_API_KEY]
+
+    # Molecule platform-managed (no tenant key — platform owns billing).
+    # Routed through the proxy Responses surface via the `platform` provider
+    # above. Must match the controlplane providers manifest's codex platform
+    # set (drift-gated by molecule-ci).
+    - id: openai/gpt-5.4
+      name: GPT-5.4 (Molecule platform)
+      provider: platform
+      required_env: []
+    - id: openai/gpt-5.4-mini
+      name: GPT-5.4 mini (Molecule platform)
+      provider: platform
+      required_env: []
 
   # Default required_env — the canvas surfaces this when no model is
   # picked. OPENAI_API_KEY is the documented direct path; subscription

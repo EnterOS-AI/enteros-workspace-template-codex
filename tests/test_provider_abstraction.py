@@ -370,3 +370,32 @@ def test_assert_model_is_not_provider_name_is_case_insensitive(pc):
         pc.assert_model_is_not_provider_name(
             "OpenAI-Subscription", providers,
         )
+
+
+# --- Group: platform-managed provider (proxy Responses surface) -----------
+
+def test_platform_provider_present_in_shipped_yaml(pc):
+    """The `platform` provider must be in the registry so the adapter's
+    platform_managed routing (explicit_provider='platform') can resolve it."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    plat = [p for p in providers if p["name"] == "platform"]
+    assert plat, "platform provider missing from config.yaml providers registry"
+    p = plat[0]
+    assert p["auth_mode"] == pc.AUTH_MODE_OPENAI_COMPAT_RESPONSES
+    assert p["wire_api"] == "responses", "codex CLI 0.130+ is Responses-API-only"
+    assert p.get("model_provider_slug") == "platform"
+    assert "MOLECULE_LLM_USAGE_TOKEN" in p["auth_env"]
+
+
+def test_resolve_explicit_platform_returns_platform(pc):
+    """resolve_provider with explicit_provider='platform' (what the adapter
+    forces under MOLECULE_LLM_BILLING_MODE=platform_managed) returns the
+    platform entry — not a subscription/openai fallback."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    picked = pc.resolve_provider(
+        model="openai/gpt-5.4", providers=providers,
+        explicit_provider="platform", env={},
+    )
+    assert picked["name"] == "platform"
+    assert picked["auth_mode"] == pc.AUTH_MODE_OPENAI_COMPAT_RESPONSES
+    assert picked["wire_api"] == "responses"
