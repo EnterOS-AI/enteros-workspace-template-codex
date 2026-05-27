@@ -197,6 +197,21 @@ class CodexAdapter(BaseAdapter):
         else:
             explicit_provider = yaml_provider or None
 
+        # Platform-managed LLM: force the `platform` provider (proxy Responses
+        # surface) regardless of MODEL_PROVIDER/yaml. In this mode the tenant
+        # has no BYOK key (the workspace-server strips them); the proxy owns
+        # the keys + usage billing. The base_url is overridden below with the
+        # injected MOLECULE_LLM_BASE_URL (per-env), and codex POSTs
+        # {base_url}/responses (wire_api=responses).
+        platform_managed = os.environ.get("MOLECULE_LLM_BILLING_MODE") == "platform_managed"
+        if platform_managed:
+            if "platform" not in provider_names:
+                raise RuntimeError(
+                    "codex adapter: MOLECULE_LLM_BILLING_MODE=platform_managed but no "
+                    "`platform` provider in the registry — add it to config.yaml `providers:`"
+                )
+            explicit_provider = "platform"
+
         # Defense-in-depth for the CP workspace-config writer bug
         # (2026-05-18 Reviewer + Researcher wedge): if the upstream
         # writer stamped a PROVIDER name into the YAML `model:` field
@@ -219,6 +234,13 @@ class CodexAdapter(BaseAdapter):
             # unknown name would route them through the wrong
             # base_url + env key (the analog #180 in claude-code).
             raise
+
+        # Platform-managed: prefer the injected per-env proxy base over the
+        # registry's static (prod) base_url, so staging routes to staging.
+        if platform_managed:
+            base = (os.environ.get("MOLECULE_LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "").strip()
+            if base:
+                picked = {**picked, "base_url": base.rstrip("/")}
 
         # Render + write config.toml. For built-in OpenAI auth modes
         # (subscription, openai_api) this writes NOTHING and clears
