@@ -92,6 +92,12 @@ def test_every_model_has_a_name_and_required_env() -> None:
     for m in cfg["runtime_config"]["models"]:
         assert m.get("name"), f"model {m} missing name"
         req = m.get("required_env") or []
+        # Platform-managed models (provider: platform) legitimately need NO
+        # tenant credential — the Molecule platform owns the provider key +
+        # billing, so required_env is intentionally empty. Every other model
+        # must declare a credential referencing the registry.
+        if str(m.get("provider", "")).strip().lower() == "platform":
+            continue
         assert req, f"model {m} missing required_env"
         for ev in req:
             assert ev in valid_env_names, (
