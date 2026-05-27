@@ -108,7 +108,12 @@ providers:
   # Responses-API-only; the CLI POSTs {base_url}/responses.
   - name: platform
     auth_mode: openai_compat_responses
-    model_prefixes: [openai/]
+    # NO model_prefixes: the adapter selects `platform` ONLY by forcing
+    # explicit_provider="platform" under MOLECULE_LLM_BILLING_MODE=platform_managed
+    # (resolve_provider precedence #1). Leaving it prefix-unmatched fences a
+    # BYOK workspace that picked an `openai/`-prefixed id from silently
+    # resolving here + hitting the prod proxy with an unset token (mis-bill).
+    model_prefixes: []
     model_aliases: []
     base_url: https://api.moleculesai.app/api/v1/internal/llm/openai/v1
     auth_env: [MOLECULE_LLM_USAGE_TOKEN, ANTHROPIC_API_KEY]
