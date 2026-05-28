@@ -1,0 +1,25 @@
+{
+  "_provenance": "AUTO-GENERATED - DO NOT EDIT. Regenerated from the synced internal/providers/providers.yaml by `python internal/providers/registry_projection.py generate <runtime>`. Hand-authored config.yaml stays authoritative; this is the registry's informational projection of this runtime.",
+  "in_registry": true,
+  "providers": [
+    {
+      "models": [
+        "gpt-5.2",
+        "gpt-5.3-codex",
+        "gpt-5.3-codex-spark",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.5"
+      ],
+      "name": "openai"
+    },
+    {
+      "models": [
+        "openai/gpt-5.4",
+        "openai/gpt-5.4-mini"
+      ],
+      "name": "platform"
+    }
+  ],
+  "runtime": "codex"
+}

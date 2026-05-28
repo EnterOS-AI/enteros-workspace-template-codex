@@ -1,0 +1,116 @@
+name: verify-providers-projection
+
+# Registry-projection drift + subset gate (internal#718 P4 Path B,
+# CTO 2026-05-27 "scope-trimmed; preserve federation contract").
+#
+# This is the molecule-core verify-providers-gen analogue for workspace
+# templates. Two invariants:
+#
+#   1. ARTIFACT DRIFT: regenerate registry-projection.json from the synced
+#      providers.yaml in memory; RED if it differs from the checked-in
+#      artifact. Catches a synced-providers.yaml update without a paired
+#      `registry_projection.py generate` run, AND catches a hand-edit of
+#      the artifact (it carries a DO NOT EDIT header).
+#
+#   2. SUBSET RELATION: for this template's runtime, every (provider,
+#      model) pair the registry claims must also be servable by the
+#      template's hand-authored authoritative source (top-level `providers:`
+#      block for claude-code/hermes/codex; runtime_config.models[] for
+#      openclaw; top-level models[] for langgraph). RED if the registry
+#      over-claims. Fails OPEN if this runtime is not in the registry at
+#      all (federation contract — mirrors molecule-ci
+#      `validate-workspace-template.py` `check_full_providers_block`).
+#
+# The hand-authored block stays AUTHORITATIVE. This gate only stops the
+# registry from claiming the template serves something it doesn't.
+#
+# ENFORCEMENT POSTURE (matches molecule-core verify-providers-gen):
+# standalone workflow; NOT in branch protection initially. Soak first;
+# promote to required check in a follow-up once the registry data
+# stabilizes (especially the claude-code colon-form non-anthropic pairs
+# flagged in the Path B PR body).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-providers-projection-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Regenerate projection, fail on drift, assert registry ⊆ template
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet pyyaml
+
+      - name: Read this template's runtime id from config.yaml
+        id: rt
+        run: |
+          set -euo pipefail
+          RT=$(python -c "import yaml,sys;print(yaml.safe_load(open('config.yaml')).get('runtime',''))")
+          if [ -z "$RT" ]; then
+            echo "::error::config.yaml has no 'runtime:' field — projection gate cannot run."
+            exit 1
+          fi
+          echo "runtime=$RT" >> "$GITHUB_OUTPUT"
+          echo "Resolved template runtime: $RT"
+
+      - name: Verify projection artifact is in sync with the synced providers.yaml
+        run: |
+          set -euo pipefail
+          python internal/providers/registry_projection.py verify "${{ steps.rt.outputs.runtime }}"
+
+      - name: Belt-and-braces — regenerate in place and assert clean tree
+        run: |
+          set -euo pipefail
+          python internal/providers/registry_projection.py generate "${{ steps.rt.outputs.runtime }}"
+          if ! git diff --quiet -- internal/providers/registry-projection.json; then
+            echo "::error::internal/providers/registry-projection.json drifted from regeneration."
+            echo "Run 'python internal/providers/registry_projection.py generate ${{ steps.rt.outputs.runtime }}' and commit the result."
+            git --no-pager diff -- internal/providers/registry-projection.json | head -120
+            exit 1
+          fi
+          echo "OK — projection artifact is in sync."
+
+      - name: Subset assertion — registry ⊆ template hand-authored block
+        run: |
+          set -euo pipefail
+          python internal/providers/registry_projection.py subset "${{ steps.rt.outputs.runtime }}"
+
+      - name: Unit tests for the projection module
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pytest
+          # --rootdir=tests pins pytest's collection root to tests/ so a
+          # repo-root __init__.py that imports adapter.py (which depends
+          # on the in-container molecule_runtime wheel, absent on the
+          # gate runner) does not get auto-collected. This isolates the
+          # projection-gate tests from the wider in-container test
+          # surface — the only thing this gate needs to verify is the
+          # projection module itself.
+          pytest -q tests/test_registry_projection.py \
+            --rootdir=tests \
+            --import-mode=importlib \
+            -p no:cacheprovider
