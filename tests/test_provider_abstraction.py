@@ -185,6 +185,80 @@ def test_explicit_provider_unknown_raises_actionable(pc):
     assert "openai_compat_responses" in msg
 
 
+# --- internal#728 Bug 2: canonical 'openai' SSOT name acceptance ----------
+
+def test_canonical_openai_with_api_key_maps_to_openai_api(pc):
+    """internal#728 Bug 2 repro (agents-team Researcher + CR2, codex/gpt-5.5,
+    2026-05-28). The controlplane providers.yaml derives the canonical
+    ``openai`` for codex/gpt-*; pre-fix the adapter rejected it with
+    `provider='openai' but it is not in the providers registry` → setup()
+    failure → JSON-RPC -32603 / A2A 503.
+
+    With OPENAI_API_KEY present and no subscription cred, the canonical
+    ``openai`` alias must map to the built-in ``openai-api`` (the credential
+    that is actually available)."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    env = {"OPENAI_API_KEY": "sk-fake-openai"}
+    picked = pc.resolve_provider(
+        model="gpt-5.5", providers=providers,
+        explicit_provider="openai", env=env,
+    )
+    assert picked["name"] == "openai-api"
+
+
+def test_canonical_openai_with_subscription_maps_to_subscription(pc):
+    """The canonical ``openai`` alias maps to ``openai-subscription`` when a
+    subscription credential (CODEX_AUTH_JSON) is present — mirrors
+    resolve_provider's subscription-first precedence so the alias and the
+    auto-detect path agree."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    env = {"CODEX_AUTH_JSON": '{"auth_mode":"chatgpt"}'}
+    picked = pc.resolve_provider(
+        model="gpt-5.5", providers=providers,
+        explicit_provider="openai", env=env,
+    )
+    assert picked["name"] == "openai-subscription"
+
+
+def test_canonical_openai_no_cred_defaults_to_openai_api(pc):
+    """Canonical ``openai`` with no credential present still RESOLVES (to the
+    openai-api built-in) rather than raising — codex's native provider then
+    surfaces the auth error at first turn with an actionable message, instead
+    of the adapter wedging at setup() / A2A 503. The decisive fix: setup()
+    must not crash on a derivable canonical provider name."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    picked = pc.resolve_provider(
+        model="gpt-5.5", providers=providers,
+        explicit_provider="openai", env={},
+    )
+    assert picked["name"] == "openai-api"
+
+
+def test_canonical_openai_is_case_insensitive(pc):
+    """The alias match is case-insensitive (parity with the existing
+    explicit-name match)."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    env = {"OPENAI_API_KEY": "sk-fake"}
+    picked = pc.resolve_provider(
+        model="gpt-5.5", providers=providers,
+        explicit_provider="OpenAI", env=env,
+    )
+    assert picked["name"] == "openai-api"
+
+
+def test_genuinely_unknown_provider_still_raises(pc):
+    """The ``openai`` alias is the ONLY new acceptance — a genuinely
+    unregistered name still raises the actionable error (the alias must not
+    have widened the gate to any name)."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    with pytest.raises(ValueError) as exc:
+        pc.resolve_provider(
+            model="gpt-5.5", providers=providers,
+            explicit_provider="anthropic-oauth", env={"OPENAI_API_KEY": "x"},
+        )
+    assert "anthropic-oauth" in str(exc.value)
+
+
 # --- Group 3: render_config_toml — built-in modes -------------------------
 
 def test_render_subscription_emits_nothing(pc):

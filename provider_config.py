@@ -65,6 +65,20 @@ AUTH_MODE_CHATGPT_SUBSCRIPTION = "chatgpt_subscription"
 AUTH_MODE_OPENAI_API = "openai_api"
 AUTH_MODE_OPENAI_COMPAT_RESPONSES = "openai_compat_responses"
 
+# Canonical SSOT provider name (internal#718 / internal#728 Bug 2).
+# molecule-controlplane's providers.yaml registry derives the OpenAI BYOK
+# provider for the codex runtime as the canonical ``openai`` (DeriveProvider
+# returns provider.Name == "openai"; the registry comment on the codex runtime
+# block notes "both [subscription + API key] map to the `openai` manifest
+# provider"). The codex adapter's OWN registry splits that into two
+# auth-mode-specific built-ins (``openai-subscription`` / ``openai-api``) because
+# codex authenticates differently per mode. Those internal names are an
+# adapter-private detail the SSOT must not have to know — so the adapter accepts
+# the canonical ``openai`` as an alias and selects the right built-in from the
+# available credential. Keeping the alias here (not in the registry) keeps the
+# SSOT canonical: the registry stays adapter-agnostic.
+CANONICAL_OPENAI_PROVIDER = "openai"
+
 _BUILTIN_AUTH_MODES = frozenset({
     AUTH_MODE_CHATGPT_SUBSCRIPTION,
     AUTH_MODE_OPENAI_API,
@@ -362,6 +376,49 @@ def resolve_provider(
         for provider in providers:
             if provider["name"].lower() == ep_lower:
                 return provider
+
+        # internal#728 Bug 2: accept the canonical SSOT name ``openai`` as an
+        # alias for codex's auth-mode-specific OpenAI built-ins. The
+        # controlplane providers.yaml derives ``openai`` for codex/gpt-* (BYOK);
+        # the adapter's registry only has ``openai-subscription`` /
+        # ``openai-api``. Without this, a re-provisioned codex workspace whose
+        # config carries provider='openai' (or MODEL_PROVIDER=openai) fails
+        # adapter.setup() -> JSON-RPC -32603 / A2A 503 (agents-team Researcher +
+        # CR2, gpt-5.5; live-confirmed 2026-05-28, comment 52493).
+        #
+        # Map ``openai`` to the right built-in by available credential:
+        # CODEX_AUTH_JSON / CODEX_CHATGPT_AUTH_JSON present -> subscription
+        # (chatgpt_subscription); else -> the openai-api (OPENAI_API_KEY) path.
+        # This mirrors resolve_provider's own subscription-first precedence
+        # (#2/#3 below) so the alias and the auto-detect path agree. If neither
+        # built-in exists in the registry (a deployer pruned them), fall through
+        # to the actionable raise rather than guessing.
+        if ep_lower == CANONICAL_OPENAI_PROVIDER:
+            sub = next(
+                (p for p in providers
+                 if p["auth_mode"] == AUTH_MODE_CHATGPT_SUBSCRIPTION
+                 and any(env.get(ev) for ev in p["auth_env"])),
+                None,
+            )
+            if sub is not None:
+                logger.info(
+                    "resolve_provider: canonical provider 'openai' + subscription "
+                    "credential present -> mapping to built-in %s",
+                    sub["name"],
+                )
+                return sub
+            api = next(
+                (p for p in providers if p["auth_mode"] == AUTH_MODE_OPENAI_API),
+                None,
+            )
+            if api is not None:
+                logger.info(
+                    "resolve_provider: canonical provider 'openai' -> mapping to "
+                    "built-in %s (no subscription credential present)",
+                    api["name"],
+                )
+                return api
+
         known = ", ".join(p["name"] for p in providers)
         raise ValueError(
             f"codex adapter: workspace config picks "
