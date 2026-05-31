@@ -144,11 +144,19 @@ COPY codex_minimax_config.sh codex_mcp_config.sh /usr/local/bin/
 # token is within 4h of expiry OR last_refresh is older than 7d. Inert
 # when no auth.json is present (the API-key / MiniMax paths skip it).
 COPY codex_auth_refresh.sh /usr/local/bin/codex_auth_refresh.sh
+# codex_auth_sync.sh — GET-ONLY auth.json re-sync watchdog (codex shared-OAuth
+# durable fix, 2026-05-31). start.sh runs it `--once` synchronously BEFORE the
+# codex app-server launches so a stale persisted auth.json is overwritten with
+# the platform's CURRENT token (the stale token is what triggers the 401→burn),
+# then loops hourly. It NEVER POSTs to any OAuth endpoint — rotation is the
+# platform central refresher's job; agents only re-sync.
+COPY codex_auth_sync.sh /usr/local/bin/codex_auth_sync.sh
 RUN chmod +x /usr/local/bin/start.sh \
              /usr/local/bin/codex_minimax_config.sh \
              /usr/local/bin/codex_mcp_config.sh \
              /usr/local/bin/render_provider_toml.py \
-             /usr/local/bin/codex_auth_refresh.sh
+             /usr/local/bin/codex_auth_refresh.sh \
+             /usr/local/bin/codex_auth_sync.sh
 
 # Build-time smoke check for the OAuth refresh watchdog (PR#24
 # regression-pin). Pre-PR#24 the script hardcoded
@@ -175,6 +183,26 @@ RUN set -eux; \
       exit 1; \
     fi; \
     echo "[image-build smoke] codex_auth_refresh.sh OAuth watchdog OK (rc=1 skip:no_auth_json — python3 helper resolves)."
+
+# Build-time smoke for the GET-only re-sync watchdog (mirrors the refresh
+# smoke). `bash -n` syntax-checks it, then `--once` runs against an ABSENT
+# CODEX_HOME — which exercises the python3 resolver and the inert no-CODEX_HOME
+# skip branch (rc=1). rc=127 means python3 didn't resolve → the re-sync would
+# ship broken and the stale-token burn would recur, so FAIL the build.
+RUN set -eux; \
+    bash -n /usr/local/bin/codex_auth_sync.sh; \
+    rc=0; \
+    CODEX_HOME=/tmp/.codex-sync-smoke-absent /usr/local/bin/codex_auth_sync.sh --once || rc=$?; \
+    rm -rf /tmp/.codex-sync-smoke-absent; \
+    if [ "$rc" -eq 127 ]; then \
+      echo "FATAL: codex_auth_sync.sh exited 127 at image-build smoke — python3 helper not located. The codex auth re-sync would ship broken and the shared-token burn would recur." >&2; \
+      exit 1; \
+    fi; \
+    if [ "$rc" -ne 1 ]; then \
+      echo "FATAL: codex_auth_sync.sh smoke produced rc=$rc (expected rc=1 skip: absent CODEX_HOME). Image-build re-sync smoke failed." >&2; \
+      exit 1; \
+    fi; \
+    echo "[image-build smoke] codex_auth_sync.sh re-sync watchdog OK (rc=1 skip:absent CODEX_HOME — python3 helper resolves)."
 
 # --- Install the OpenAI Codex CLI globally as root (binary lives in
 # /usr/lib/node_modules and symlinks into /usr/bin/codex; available to

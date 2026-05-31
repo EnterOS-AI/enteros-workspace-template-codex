@@ -128,7 +128,7 @@ jobs:
       - name: ShellCheck boot + provider helpers
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -S error start.sh codex_minimax_config.sh codex_mcp_config.sh
+          shellcheck -S error start.sh codex_minimax_config.sh codex_mcp_config.sh codex_auth_sync.sh
 
   # pc2-safe: false — needs docker for Docker build smoke; routes to docker-host only
   # (task #390 B-lite — PC2 native runners advertise `ubuntu-latest` but cannot

@@ -310,6 +310,21 @@ attempt_refresh_once() {
     return 1
   fi
 
+  # OWNER GATE (codex shared-OAuth durable fix, 2026-05-31): the per-agent
+  # OAuth POST is DISABLED BY DEFAULT. The single-use refresh_token must be
+  # rotated by exactly ONE owner — the platform-side central refresher
+  # (molecule-core internal/codexauth) — because N agents sharing ONE global
+  # CODEX_AUTH_JSON each refreshing on their own 401 burns the single-use
+  # refresh_token within seconds (each rotation invalidates the siblings).
+  # The template NEVER sets CODEX_AUTH_REFRESH_OWNER; workspaces instead GET
+  # the current token via codex_auth_sync.sh. CODEX_AUTH_REFRESH_OWNER=1 is
+  # reserved for a single operator/owner box that legitimately owns the seed.
+  if [ "${CODEX_AUTH_REFRESH_OWNER:-0}" != "1" ]; then
+    log "skip: per-agent OAuth refresh is disabled (CODEX_AUTH_REFRESH_OWNER!=1) — token rotation is owned by the platform central refresher; this workspace re-syncs via codex_auth_sync.sh. auth.json untouched."
+    write_status "" -1 "skip:not_refresh_owner"
+    return 1
+  fi
+
   local decision rc=0
   # Use a temp file so the multi-line decision output is fully captured.
   local decision_file

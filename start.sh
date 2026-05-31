@@ -222,8 +222,67 @@ if [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${MINIMAX_API_KEY:-}" ] \
   echo "[start.sh] WARN: no OPENAI_API_KEY, MINIMAX_API_KEY, nor ~/.codex/auth.json. Workspace will fail preflight." >&2
 fi
 
-# --- OAuth refresh watchdog (RFC internal#569) ---
-# Codex CLI 0.130.0 only refreshes auth.json on the demand path
+# --- Codex auth RE-SYNC (GET-only) — codex shared-OAuth durable fix ---
+# (2026-05-31) Multiple codex agents share ONE ChatGPT-Pro OAuth token
+# (the platform global secret CODEX_AUTH_JSON). OpenAI's refresh_token is
+# SINGLE-USE, so letting each per-agent app-server refresh on its own 401
+# burned the shared seed within seconds. The durable fix:
+#   - ONE owner rotates the refresh_token: the platform central refresher
+#     (molecule-core internal/codexauth), which writes the rotated blob
+#     back to global_secrets.
+#   - EVERY workspace only RE-SYNCS (GET) the current token from the
+#     platform and overwrites auth.json. codex_auth_sync.sh does this.
+#
+# CRITICAL ORDERING: the /home/agent volume PERSISTS auth.json across
+# restarts. A STALE auth.json is exactly what triggers the 401→burn. So we
+# run the sync `--once` SYNCHRONOUSLY HERE — BEFORE the codex app-server
+# launches (it launches via `exec gosu agent molecule-runtime` at the end of
+# this script) — so the app-server always starts on the platform's CURRENT
+# token, never the stale persisted one. The ENV-injected auth.json above is
+# only the bootstrap seed; the GET is authoritative.
+SYNC_SCRIPT=""
+for cand in /usr/local/bin/codex_auth_sync.sh /app/codex_auth_sync.sh; do
+  if [ -x "$cand" ]; then SYNC_SCRIPT="$cand"; break; fi
+done
+if [ -n "$SYNC_SCRIPT" ]; then
+  # Boot-time synchronous re-sync. rc 0=synced, 1=skip (not a shared-codex
+  # workspace / no token), 2=transient. We log but NEVER fail start.sh — a
+  # transient platform hiccup must not block boot; the loop + the bootstrap
+  # ENV auth.json are the fallbacks.
+  gosu agent env \
+    CODEX_HOME=/home/agent/.codex \
+    HOME=/home/agent \
+    WORKSPACE_ID="${WORKSPACE_ID:-}" \
+    PLATFORM_URL="${PLATFORM_URL:-}" \
+    WORKSPACE_SERVER_URL="${WORKSPACE_SERVER_URL:-}" \
+    CONFIGS_DIR="${CONFIGS_DIR:-}" \
+    "$SYNC_SCRIPT" --once || \
+    echo "[start.sh] codex_auth_sync --once non-zero (skip/transient); continuing — loop + bootstrap auth.json are the fallback" >&2
+  # Long-running re-sync loop (background, gosu agent). Re-pulls the current
+  # token every hour so a mid-session platform rotation propagates here.
+  gosu agent env \
+    CODEX_HOME=/home/agent/.codex \
+    HOME=/home/agent \
+    WORKSPACE_ID="${WORKSPACE_ID:-}" \
+    PLATFORM_URL="${PLATFORM_URL:-}" \
+    WORKSPACE_SERVER_URL="${WORKSPACE_SERVER_URL:-}" \
+    CONFIGS_DIR="${CONFIGS_DIR:-}" \
+    "$SYNC_SCRIPT" &
+  echo "[start.sh] codex_auth_sync re-sync watchdog launched (pid=$!)"
+else
+  echo "[start.sh] WARN: codex_auth_sync.sh not found; codex auth re-sync disabled" >&2
+fi
+
+# --- OAuth refresh watchdog (RFC internal#569) — DISABLED BY DEFAULT ---
+# The per-agent OAuth POST is gated off (CODEX_AUTH_REFRESH_OWNER!=1, which
+# the template NEVER sets) by the durable shared-OAuth fix above: N agents
+# sharing one refresh_token must NOT each rotate it. codex_auth_refresh.sh
+# is retained (and still launched, so a single owner box can opt in via
+# CODEX_AUTH_REFRESH_OWNER=1), but with the gate it only does GET-free skip
+# logging. Token rotation is the platform central refresher's job; this
+# workspace re-syncs via codex_auth_sync.sh above.
+#
+# (historical) Codex CLI 0.130.0 only refreshes auth.json on the demand path
 # `AuthManager::auth().await`. In our prod-Reviewer / prod-Researcher
 # topology the workspace can be idle (or wedged in executor.py) for
 # >8 days between turns, so `auth()` never fires and the access_token

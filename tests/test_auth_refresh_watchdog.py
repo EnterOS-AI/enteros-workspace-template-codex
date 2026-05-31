@@ -137,6 +137,13 @@ def _run_once(
         # whatever `command -v python3` happens to resolve to on the
         # CI runner.
         "CODEX_PYTHON": _REAL_PY,
+        # OWNER GATE (codex shared-OAuth durable fix, 2026-05-31): the per-agent
+        # OAuth POST is DISABLED unless CODEX_AUTH_REFRESH_OWNER=1. The template
+        # never sets it (workspaces re-sync via codex_auth_sync.sh; rotation is
+        # the platform central refresher's job). These rotation tests assert the
+        # OWNER path, so they opt in explicitly. The owner-gate test below runs
+        # WITHOUT this var to prove the default-off behavior.
+        "CODEX_AUTH_REFRESH_OWNER": "1",
         # Short timeouts so the test suite runs in seconds, not hours.
         "CODEX_AUTH_REFRESH_INTERVAL_SECONDS": "30",
         "CODEX_AUTH_SAFETY_MARGIN_SECONDS": "14400",
@@ -376,4 +383,62 @@ def test_stale_last_refresh_triggers_refresh_even_with_fresh_jwt(tmp_path: Path)
         server.shutdown()
 
     assert result.returncode == 0, f"expected refresh on stale last_refresh; rc={result.returncode}\nstderr={result.stderr}"
+    _assert_no_token_in_output(result)
+
+
+def test_owner_gate_default_off_no_oauth_post_auth_json_untouched(tmp_path: Path) -> None:
+    """Codex shared-OAuth durable fix (2026-05-31): the per-agent OAuth POST is
+    DISABLED unless CODEX_AUTH_REFRESH_OWNER=1. The template never sets it, so a
+    workspace whose token is DUE for refresh must NOT POST and must leave
+    auth.json byte-identical — the platform central refresher owns rotation.
+
+    This is the anti-storm guarantee at the template layer: N agents sharing one
+    single-use refresh_token cannot each rotate it (which would invalidate the
+    siblings). Without the owner flag, the watchdog skips with a clear reason.
+    """
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    # exp 1h IN THE PAST → would force a refresh if the owner gate were open.
+    auth_path = codex_home / "auth.json"
+    _write_auth_json(auth_path, access_token_exp_offset=-3600)
+    before = auth_path.read_text()
+
+    # Stand up a mock OAuth server and assert it is NEVER hit.
+    server, url, _ = _start_mock_server(
+        200, {"access_token": _make_jwt({"exp": int(time.time()) + 3600})}
+    )
+    try:
+        # Run WITHOUT CODEX_AUTH_REFRESH_OWNER (strip it from inherited env).
+        env = {
+            **os.environ,
+            "CODEX_HOME": str(codex_home),
+            "HOME": str(codex_home.parent),
+            "CODEX_PYTHON": _REAL_PY,
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE": url,
+        }
+        env.pop("CODEX_AUTH_REFRESH_OWNER", None)
+        result = subprocess.run(
+            ["bash", str(_SCRIPT), "--once"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        server.shutdown()
+
+    # Skipped (rc=1), with the not-owner reason; no OAuth POST was made.
+    assert result.returncode == 1, (
+        f"expected skip rc=1 (not refresh owner); got rc={result.returncode}\n"
+        f"stderr={result.stderr}"
+    )
+    assert "CODEX_AUTH_REFRESH_OWNER" in result.stderr or "not_refresh_owner" in (
+        result.stderr + result.stdout
+    )
+    assert _MockOAuthHandler.received_body is None, (
+        "owner gate off but an OAuth POST was made — the per-agent refresh storm "
+        "guard is broken"
+    )
+    # auth.json byte-identical.
+    assert auth_path.read_text() == before, "auth.json was modified despite owner gate being off"
     _assert_no_token_in_output(result)
