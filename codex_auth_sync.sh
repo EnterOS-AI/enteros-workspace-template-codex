@@ -64,6 +64,9 @@ SYNC_INTERVAL="${CODEX_AUTH_SYNC_INTERVAL_SECONDS:-3600}"
 
 # Platform routing — mirror codex_mcp_config.sh / a2a_client.py defaults.
 PLATFORM_URL_VAL="${WORKSPACE_SERVER_URL:-${PLATFORM_URL:-http://platform:8080}}"
+# Org routing header — the SaaS tenant API requires X-Molecule-Org-Id matching the
+# org UUID (TENANT_ORG_HEADER_REQUIRED); without it the re-sync GET 400s.
+ORG_ID_VAL="${MOLECULE_ORG_ID:-${ORG_ID:-}}"
 WORKSPACE_ID_VAL="${WORKSPACE_ID:-}"
 
 log() {
@@ -129,6 +132,7 @@ attempt_sync_once() {
   http_code="$(
     curl -sS --max-time 30 \
       -H "Authorization: Bearer ${auth_token}" \
+      -H "X-Molecule-Org-Id: ${ORG_ID_VAL}" \
       -H "Accept: application/json" \
       -X GET \
       -o "$response_file" \
