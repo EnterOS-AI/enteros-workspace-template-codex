@@ -629,3 +629,42 @@ async def test_execute_text_only_still_passes_prompt_unchanged() -> None:
     await ex.execute(ctx, queue)
 
     assert captured_prompts == ["write a haiku"]
+
+
+@pytest.mark.asyncio
+async def test_steer_injects_priority_directive_and_friendly_placeholder() -> None:
+    """Approach B (chat-priority): a message arriving while a turn is in
+    flight is steered with an explicit reply-promptly directive, and the
+    canvas sees a human-readable placeholder rather than the old internal
+    "[steered into in-flight turn ...]" jargon."""
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+    ex._thread_id = "thread-1"  # type: ignore[attr-defined]
+    ex._current_turn_id = "turn-1"  # type: ignore[attr-defined]
+
+    steer_calls: list = []
+
+    async def _rec(method, params, timeout=None):  # type: ignore[no-untyped-def]
+        steer_calls.append((method, params))
+        return {}
+
+    ex._app_server.request = _rec  # type: ignore[assignment,method-assign]
+
+    queue = _CapturingQueue()
+    ctx = _ctx_with_parts([_text_part("give me a one-line status")])
+
+    await ex._turn_lock.acquire()
+    try:
+        await ex.execute(ctx, queue)
+    finally:
+        ex._turn_lock.release()
+
+    steers = [pr for m, pr in steer_calls if m == "turn/steer"]
+    assert steers, f"expected a turn/steer call; saw {[m for m, _ in steer_calls]}"
+    blob = " ".join(it.get("text", "") for it in steers[0]["input"])
+    assert "reply to them promptly" in blob
+    assert "give me a one-line status" in blob
+
+    ev = repr(queue.events)
+    assert "will reply here shortly" in ev
+    assert "steered into in-flight turn" not in ev
