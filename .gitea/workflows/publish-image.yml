@@ -238,6 +238,7 @@ jobs:
             org.opencontainers.image.description=Molecule AI workspace template — codex runtime
 
       - name: Surface pushed digest as commit status (operator promotes — keeps AWS off the deploy path)
+        continue-on-error: true  # best-effort: a status-post 403 must NEVER fail the build (image already pushed)
         if: always() && steps.push.outcome == 'success'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
@@ -245,10 +246,14 @@ jobs:
           VER: ${{ needs.resolve-version.outputs.version }}
           GT: ${{ secrets.GITEA_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail   # NOT -e: the status post is best-effort and must not abort the job
           echo "::notice::pushed digest ${DIGEST} (runtime ${VER}, tag sha-${SHA7})"
-          test -n "${DIGEST}" || { echo "::error::build-push-action returned an empty digest"; exit 1; }
+          if [ -z "${DIGEST}" ]; then echo "::warning::build-push-action returned an empty digest"; exit 0; fi
           body="$(printf '{"state":"success","context":"runtime-image/pushed-digest","description":"%s runtime=%s tag=sha-%s","target_url":"%s/%s"}' "${DIGEST}" "${VER}" "${SHA7}" "${GITHUB_SERVER_URL}" "${{ github.repository }}")"
-          curl -fsS -X POST "${GITHUB_SERVER_URL}/api/v1/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
-            -H "Authorization: token ${GT}" -H "Content-Type: application/json" -d "${body}"
-          echo "::notice::commit status runtime-image/pushed-digest set — operator can promote without AWS"
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${GITHUB_SERVER_URL}/api/v1/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -H "Authorization: token ${GT}" -H "Content-Type: application/json" -d "${body}" || echo 000)"
+          if [ "${code}" = "201" ] || [ "${code}" = "200" ]; then
+            echo "::notice::commit status runtime-image/pushed-digest set — operator can promote without AWS"
+          else
+            echo "::warning::digest status post returned HTTP ${code} (best-effort; the digest above is recoverable from this build log — see #29 'pushing manifest ...@sha256')"
+          fi
