@@ -250,11 +250,26 @@ class CodexAppServerExecutor(AgentExecutor):
             and self._current_turn_id is not None
         ):
             try:
+                # Approach B (chat-priority): a message arriving mid-turn would
+                # otherwise be steered into a long in-flight turn (e.g. an
+                # autonomous tick) and the agent could keep doing self-directed
+                # work without surfacing a reply — leaving a canvas user staring
+                # at the placeholder. Prepend an explicit directive so codex
+                # answers the waiting requester promptly within the steered turn.
+                steer_prompt = (
+                    "[A new message just arrived while you are mid-task. If it "
+                    "is from the user, reply to them promptly via the "
+                    "send_message_to_user tool (a brief acknowledgement or a "
+                    "direct answer) before continuing your current work — do "
+                    "not leave them waiting. If it is a delegated/peer request, "
+                    "address it as appropriate. Their message follows:]\n\n"
+                    + prompt
+                )
                 await self._app_server.request(
                     "turn/steer",
                     {
                         "threadId": self._thread_id,
-                        "input": self._build_turn_input(prompt, attached),
+                        "input": self._build_turn_input(steer_prompt, attached),
                         "expectedTurnId": self._current_turn_id,
                     },
                     timeout=5.0,
@@ -269,8 +284,8 @@ class CodexAppServerExecutor(AgentExecutor):
                 # MCP tool calls within the steered turn's response.
                 await event_queue.enqueue_event(
                     new_text_message(
-                        "[steered into in-flight turn — agent will reply "
-                        "via send_message_to_user / delegate_task]"
+                        "Got your message \u2014 I\u2019m mid-task right now "
+                        "and will reply here shortly."
                     )
                 )
                 return
