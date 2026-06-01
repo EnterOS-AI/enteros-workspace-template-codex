@@ -46,6 +46,7 @@ env:
 
 permissions:
   contents: read
+  statuses: write
 
 jobs:
   resolve-version:
@@ -69,6 +70,17 @@ jobs:
             echo "no .runtime-version file — will use Dockerfile/requirements.txt pin"
           fi
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          # Drift guard: the image pins runtime from .runtime-version (RUNTIME_VERSION build-arg).
+          # requirements.txt MUST agree, or a requirements-only bump silently ships the old runtime
+          # (root cause of the 2026-05-31 codex chat regression — PR#69 bumped only requirements.txt).
+          if [ -f .runtime-version ] && [ -f requirements.txt ]; then
+            req="$(grep -E '^molecule-ai-workspace-runtime==' requirements.txt | head -n1 | sed -E 's/.*==//' | tr -d '[:space:]')"
+            if [ -n "${req}" ] && [ "${req}" != "${v:-}" ]; then
+              echo "::error::.runtime-version (${v:-<unset>}) != requirements.txt pin (${req}). Bump BOTH — the image pins from .runtime-version."
+              exit 1
+            fi
+            echo "runtime-version/requirements pin agree: ${v:-} == ${req:-<none>}"
+          fi
 
   publish:
     name: Build & push workspace-template-codex image
@@ -208,6 +220,7 @@ jobs:
           echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
 
       - name: Push image to ECR (post-smoke)
+        id: push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
@@ -223,3 +236,19 @@ jobs:
             org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — codex runtime
+
+      - name: Surface pushed digest as commit status (operator promotes — keeps AWS off the deploy path)
+        if: always() && steps.push.outcome == 'success'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SHA7: ${{ needs.resolve-version.outputs.sha }}
+          VER: ${{ needs.resolve-version.outputs.version }}
+          GT: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::notice::pushed digest ${DIGEST} (runtime ${VER}, tag sha-${SHA7})"
+          test -n "${DIGEST}" || { echo "::error::build-push-action returned an empty digest"; exit 1; }
+          body="$(printf '{"state":"success","context":"runtime-image/pushed-digest","description":"%s runtime=%s tag=sha-%s","target_url":"%s/%s"}' "${DIGEST}" "${VER}" "${SHA7}" "${GITHUB_SERVER_URL}" "${{ github.repository }}")"
+          curl -fsS -X POST "${GITHUB_SERVER_URL}/api/v1/repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -H "Authorization: token ${GT}" -H "Content-Type: application/json" -d "${body}"
+          echo "::notice::commit status runtime-image/pushed-digest set — operator can promote without AWS"
