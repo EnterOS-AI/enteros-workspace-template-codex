@@ -328,6 +328,23 @@ if [ -s "/home/agent/.codex/auth.json" ]; then
   fi
 fi
 
+# Boot assertion (core#2128): confirm the codex command path has outbound
+# network. With sandbox_mode=danger-full-access there is NO inner bwrap
+# sandbox, so codex executes commands directly in this container — a bare
+# agent-context network call is therefore representative of what a codex
+# command gets (the reviewer's "not just bare container networking" caveat
+# applied to the workspace-write variant, where the sandbox differed; here
+# the sandbox is off, so bare == sandboxed). Log loudly; never abort boot
+# (a transient DNS blip must not wedge startup, and the agent is still
+# useful for non-network work).
+CODEX_BOOT_CHECK_URL="${CODEX_BOOT_CHECK_URL:-https://git.moleculesai.app/api/v1/version}"
+boot_http=$(gosu agent curl -s -m 10 -o /dev/null -w '%{http_code}' "$CODEX_BOOT_CHECK_URL" 2>/dev/null || echo "000")
+if [ "$boot_http" = "200" ]; then
+  echo "[start.sh] codex sandbox boot-check OK: ${CODEX_BOOT_CHECK_URL} -> 200 (sandbox_mode=danger-full-access)"
+else
+  echo "[start.sh] WARN: codex sandbox boot-check FAILED: ${CODEX_BOOT_CHECK_URL} -> ${boot_http} (expected 200) — codex commands may be network-blocked; verify sandbox_mode=danger-full-access in ~/.codex/config.toml" >&2
+fi
+
 # Hand off to molecule-runtime. From here, every A2A message routes
 # through executor.py → app_server.py → codex app-server child.
 exec gosu agent molecule-runtime
