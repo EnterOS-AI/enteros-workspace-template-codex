@@ -116,7 +116,19 @@ providers:
     model_prefixes: []
     model_aliases: []
     base_url: https://api.moleculesai.app/api/v1/internal/llm/openai/v1
-    auth_env: [MOLECULE_LLM_USAGE_TOKEN, ANTHROPIC_API_KEY]
+    # #2250: the codex platform leg authenticates with the injected
+    # MOLECULE_LLM_USAGE_TOKEN bearer ONLY — codex is an OpenAI-family
+    # runtime and never reads an Anthropic key. The trailing
+    # ANTHROPIC_API_KEY was cross-runtime drift (copied from the
+    # claude-code platform arm). It was inert on the happy path because
+    # render_config_toml picks the FIRST non-builtin auth_env entry as
+    # env_key, but it left a latent footgun: if MOLECULE_LLM_USAGE_TOKEN
+    # were ever absent, env_key would silently fall through to
+    # ANTHROPIC_API_KEY and POST an Anthropic key to the OpenAI proxy leg.
+    # Pinned by tests/test_provider_abstraction.py
+    # ::test_platform_auth_env_is_usage_token_only +
+    # ::test_no_codex_provider_carries_anthropic_key.
+    auth_env: [MOLECULE_LLM_USAGE_TOKEN]
     wire_api: responses
     model_provider_slug: platform
 

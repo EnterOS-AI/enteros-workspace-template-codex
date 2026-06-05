@@ -461,6 +461,51 @@ def test_platform_provider_present_in_shipped_yaml(pc):
     assert "MOLECULE_LLM_USAGE_TOKEN" in p["auth_env"]
 
 
+def test_platform_auth_env_is_usage_token_only(pc):
+    """#2250 exact-equality gate: the codex `platform` leg authenticates
+    with the injected MOLECULE_LLM_USAGE_TOKEN bearer ONLY.
+
+    render_config_toml picks the FIRST non-builtin auth_env entry as the
+    config.toml ``env_key``. The platform arm previously carried a trailing
+    ``ANTHROPIC_API_KEY`` (cross-runtime drift copied from the claude-code
+    platform arm). It was inert on the happy path — MOLECULE_LLM_USAGE_TOKEN
+    sorts first — but if that token were ever unset, env_key would silently
+    fall through to ANTHROPIC_API_KEY and the codex CLI would POST an
+    Anthropic key to the OpenAI-compat proxy leg (the #2250 mis-auth
+    footgun). Pin EXACT equality so any future re-addition fails CI.
+    """
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    plat = next(p for p in providers if p["name"] == "platform")
+    assert list(plat["auth_env"]) == ["MOLECULE_LLM_USAGE_TOKEN"], (
+        f"codex platform auth_env drifted: {list(plat['auth_env'])!r}; "
+        "must be exactly [MOLECULE_LLM_USAGE_TOKEN] (#2250). A vendor key "
+        "here can become the rendered env_key when the usage token is absent."
+    )
+    # And the rendered config.toml env_key must be the usage token — the
+    # consequence the exact-equality gate protects.
+    toml = pc.render_config_toml(plat, model="gpt-5.5")
+    assert 'env_key = "MOLECULE_LLM_USAGE_TOKEN"' in toml, (
+        "platform config.toml must read the usage token as its bearer env_key"
+    )
+
+
+def test_no_codex_provider_carries_anthropic_key(pc):
+    """No codex provider may carry an Anthropic key in auth_env. codex is an
+    OpenAI-family runtime; an ANTHROPIC_* env in ANY provider's auth_env is
+    cross-runtime drift (#2250) — it can be rendered as the bearer env_key
+    for an openai_compat_responses leg. Scan the whole shipped registry."""
+    providers = pc.load_providers(workspace_config_path=str(_ROOT))
+    offenders = {
+        p["name"]: list(p["auth_env"])
+        for p in providers
+        if any("ANTHROPIC" in ev.upper() for ev in p["auth_env"])
+    }
+    assert not offenders, (
+        f"codex providers must not carry an Anthropic auth_env key (#2250): "
+        f"{offenders!r}"
+    )
+
+
 def test_resolve_explicit_platform_returns_platform(pc):
     """resolve_provider with explicit_provider='platform' (what the adapter
     forces under MOLECULE_LLM_BILLING_MODE=platform_managed) returns the
