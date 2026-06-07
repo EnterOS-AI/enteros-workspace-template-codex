@@ -56,7 +56,12 @@ logger = logging.getLogger(__name__)
 # Per-turn timeout. Codex turns can run minutes during heavy tool use
 # (test runs, edits, web fetches). Tighter than infinite to bound
 # debug-time hangs.
-_TURN_TIMEOUT = 600.0
+_TURN_TIMEOUT = 3600.0  # generous backstop ONLY. The inactivity watchdog
+# below is the primary bound: an actively-progressing turn (codex still
+# emitting events / tool-call I/O) must NOT be hard-killed mid-work. The
+# old 600s cap killed long-but-healthy reviews while tool-calls were still
+# flowing — the CR2/codex review-lane wedge (CTO 2026-06-07: extend on
+# activity, don't hard-cap every turn).
 
 # Inactivity watchdog: cap the gap BETWEEN events from codex. A healthy
 # turn emits frequent ``codex/event/*`` notifications (token deltas,
@@ -71,7 +76,10 @@ _TURN_TIMEOUT = 600.0
 #   - Wedged channel: zero events, zero rollout bytes for the full
 #     ``_TURN_TIMEOUT`` window. The watchdog catches that in 90 s
 #     instead of 600 s, and prints a diagnostic message.
-_TURN_INACTIVITY_TIMEOUT = 90.0
+_TURN_INACTIVITY_TIMEOUT = 300.0  # raised from 90s: long active tool-use
+# (test runs, large-diff reviews) can be legitimately quiet for minutes
+# between event bursts. Only a genuinely wedged channel (zero events for
+# 5 min) fails the turn; healthy activity keeps extending it.
 
 # Bootstrap RPC timeouts. ``thread/start`` is an exchange that the
 # initialised child should answer in well under a second; capping it
