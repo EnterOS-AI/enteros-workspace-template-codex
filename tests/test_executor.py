@@ -668,3 +668,39 @@ async def test_steer_injects_priority_directive_and_friendly_placeholder() -> No
     ev = repr(queue.events)
     assert "will reply here shortly" in ev
     assert "steered into in-flight turn" not in ev
+
+
+@pytest.mark.asyncio
+async def test_execute_timeout_resets_app_server_for_next_turn() -> None:
+    """molecule-ai/internal#653 / #781: a per-turn ``TimeoutError`` must drop
+    the cached app-server + thread (via ``_reset_app_server``) so the NEXT
+    turn starts fresh.
+
+    Pre-fix, the timeout handler returned the ``[codex turn timed out ...]``
+    placeholder WITHOUT resetting, leaving a stale app-server child cached so
+    every subsequent turn re-timed-out until container restart — the
+    CR2/codex review-lane wedge. Mutation check: revert the
+    ``_reset_app_server()`` call in the handler and these assertions fail.
+    """
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+    ex._thread_id = "thread-stale"  # type: ignore[attr-defined]
+    ex._current_turn_id = "turn-stale"  # type: ignore[attr-defined]
+    assert ex._app_server is not None  # baseline: a cached child is present
+
+    async def timing_out_turn(prompt: str) -> str:
+        raise asyncio.TimeoutError("codex turn exceeded the 600s budget")
+
+    ex._run_turn = timing_out_turn  # type: ignore[assignment,method-assign]
+
+    ctx = _ctx_with_parts([_text_part("review this PR")])
+    queue = _CapturingQueue()
+    await ex.execute(ctx, queue)
+
+    # The timeout is still surfaced to the canvas...
+    assert any("timed out" in repr(e) for e in queue.events)
+    # ...AND the stale app-server / thread are cleared so the next turn
+    # starts fresh instead of re-timing-out until a container restart.
+    assert ex._app_server is None
+    assert ex._thread_id is None
+    assert ex._current_turn_id is None
