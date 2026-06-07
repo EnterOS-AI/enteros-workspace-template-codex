@@ -314,6 +314,13 @@ class CodexAppServerExecutor(AgentExecutor):
                 return
             except asyncio.TimeoutError:
                 logger.warning("codex turn timed out after %.0fs", _TURN_TIMEOUT)
+                # Drop the cached app-server + thread so the NEXT turn
+                # starts fresh. Without this the stale app-server child
+                # stays cached and every subsequent turn re-times-out
+                # until container restart — the CR2/codex review-lane
+                # 600s wedge (molecule-ai/internal#653, #781). Mirrors
+                # the ConnectionError path below.
+                await self._reset_app_server()
                 await event_queue.enqueue_event(
                     new_text_message(
                         f"[codex turn timed out after {_TURN_TIMEOUT:.0f}s]"
