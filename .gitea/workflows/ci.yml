@@ -304,7 +304,7 @@ jobs:
   validate:
     name: validate
     runs-on: ubuntu-latest
-    needs: [validate-static, validate-runtime, t4-conformance]
+    needs: [validate-static, validate-runtime, t4-conformance, tests]
     if: always()
     timeout-minutes: 1
     steps:
@@ -313,9 +313,11 @@ jobs:
           static="${{ needs.validate-static.result }}"
           runtime="${{ needs.validate-runtime.result }}"
           t4="${{ needs.t4-conformance.result }}"
+          tests="${{ needs.tests.result }}"
           echo "validate-static:  $static"
           echo "validate-runtime: $runtime"
           echo "t4-conformance:   $t4"
+          echo "tests:            $tests"
           if [ "$static" != "success" ]; then
             echo "::error::validate-static did not succeed: $static"
             exit 1
@@ -333,7 +335,11 @@ jobs:
             echo "::error::t4-conformance did not succeed: $t4 — T4 host-root reach / codex MCP token-ownership not verified on a live container. Failing closed (RFC internal#456 §11)."
             exit 1
           fi
-          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4)"
+          if [ "$tests" != "success" ]; then
+            echo "::error::Adapter unit tests did not succeed: $tests"
+            exit 1
+          fi
+          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4, tests=$tests)"
 
   tests:
     name: Adapter unit tests
