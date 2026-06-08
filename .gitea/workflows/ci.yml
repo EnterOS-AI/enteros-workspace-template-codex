@@ -348,7 +348,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: pip install -q pytest pytest-asyncio pyyaml
-      # Tests under tests/ exercise the executor turn lifecycle +
-      # app_server JSON-RPC plumbing against a mock codex binary; they
-      # do not need molecule_runtime importable at collection time.
+      # The adapter credential-preflight tests (test_modernization_pr1.py)
+      # import molecule_runtime.adapters.base via the _adapter fixture.
+      - run: pip install -q molecule-ai-workspace-runtime
       - run: python3 -m pytest tests/ -v
