@@ -28,14 +28,26 @@ molecule-core for the full design rationale.
 | `app_server.py` | `AppServerProcess` — async JSON-RPC over NDJSON stdio against the codex app-server child |
 | `tests/` | 12 unit tests covering both modules; `mock_app_server.py` is a Python NDJSON stand-in for the real `codex` binary |
 | `config.yaml` | Runtime config — model list (OpenAI-only), required env, A2A wiring |
-| `Dockerfile` | python:3.11-slim + Node.js 20 + `npm i -g @openai/codex@^0.72` + molecule_runtime |
-| `start.sh` | Verifies codex binary + OPENAI_API_KEY, then exec's molecule-runtime |
+| `Dockerfile` | python:3.11-slim + Node.js 20 + `npm i -g @openai/codex@0.130.0` (exact pin) + molecule_runtime |
+| `start.sh` | Verifies codex binary, materializes the ChatGPT/Codex-subscription `auth.json` (Mode C), then exec's molecule-runtime |
+
+## Auth (codex resolves any ONE of these)
+
+Codex needs exactly one credential. Resolution order mirrors OpenClaw's
+`openai-codex` provider — an injected subscription `auth.json` is
+preferred over the pay-as-you-go API key:
+
+| Credential | How it's supplied | Notes |
+|---|---|---|
+| `CODEX_AUTH_JSON` | Workspace Config-tab secret bound from Infisical SSOT `/shared/codex-oauth` key `CODEX_AUTH_JSON` (env=prod). `start.sh` writes it to `~/.codex/auth.json` (0600, agent-owned) + sets `cli_auth_credentials_store = "file"` / `forced_login_method = "chatgpt"`. | **Preferred.** ChatGPT/Codex *subscription* OAuth (`auth_mode:"chatgpt"`). SINGLE-RUNNER only — never fan out across concurrent workspaces. `CODEX_CHATGPT_AUTH_JSON` is a backward-compat alias (PR #5); `CODEX_AUTH_JSON` wins if both set. Requires codex CLI ≥ the 0.13x line (this image pins 0.130.0); the legacy 0.57 line cannot consume this format. |
+| `OPENAI_API_KEY` | Config-tab env | **Documented fallback.** Pay-as-you-go OpenAI platform key. Retained, not removed. |
+| `MINIMAX_API_KEY` | Config-tab env | MiniMax chat-wire route (`codex_minimax_config.sh`). |
 
 ## Required env
 
 | Variable | Required | Notes |
 |---|---|---|
-| `OPENAI_API_KEY` | Yes | Codex is OpenAI-only |
+| one codex credential | Yes | `CODEX_AUTH_JSON` (preferred) **or** `OPENAI_API_KEY` (fallback) **or** `MINIMAX_API_KEY` — see Auth table |
 | `MOLECULE_PLATFORM_URL` | Yes | Standard molecule-runtime |
 | `MOLECULE_WORKSPACE_ID` | Yes | Standard molecule-runtime |
 

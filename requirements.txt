@@ -1,7 +1,30 @@
 # Molecule AI workspace runtime — adapter + A2A server infra
-molecule-ai-workspace-runtime>=0.1.0
+molecule-ai-workspace-runtime==0.3.14
+# Pin a2a-sdk: the runtime parses a2a messages; floating into a new major
+# (1.0.x protobuf migration) silently broke message extraction. Pin it.
+a2a-sdk==1.0.3
+
+# P0 band-aid for canvas-chat upload 400 "failed to parse multipart form"
+# (task #256; forensic a5bb950f). Starlette `Request.form()` raises
+# AssertionError parsing multipart bodies when python-multipart is absent.
+# Pinned in molecule-core mc#1578 (SSOT, MERGED 2026-05-19T21:41Z) but the
+# PyPI publish of the updated runtime wheel is gated on the Gitea middleman
+# rename + PyPI abuse-block recovery. This direct pin in each template is
+# REDUNDANT (and harmless) once mc#1578's runtime tag publishes — at that
+# point the runtime wheel itself will carry python-multipart as a transitive.
+python-multipart>=0.0.27
 
 # No additional Python deps. The codex CLI is a Node.js binary
 # installed via npm in the Dockerfile; the executor talks to its
 # stdio app-server using only the asyncio + json modules from the
 # standard library.
+#
+# MiniMax provider is wired via a static config.toml written by
+# codex_minimax_config.sh — no proxy or translation layer needed
+# (the codex WireApi enum natively supports both `responses` and
+# `chat`; MiniMax uses `chat`). The Dockerfile pins @openai/codex to
+# the exact patch release 0.130.0 — the npm `latest` stable line and
+# the first pinned line that supports ChatGPT/Codex-subscription
+# OAuth auth.json (the prior ~0.57 pin predated it). The app-server
+# protocol is `experimental` and breaks across minors; bump
+# deliberately, with a re-verification, when validating a new release.

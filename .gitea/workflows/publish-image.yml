@@ -1,0 +1,383 @@
+name: publish-image
+
+# Builds the codex workspace template Dockerfile and pushes it to ECR as
+# `<REGISTRY>/molecule-ai/workspace-template-codex:latest` + `:sha-<7>`.
+#
+# Ported verbatim in shape from the live-verified claude-code template
+# publish-image.yml (PR#25 / bbc2dae). The codex repo had NO publish
+# pipeline before this — the deployed prod image
+# sha256:877e0687704cbfdd0f5fca367131088746a68c3d4fccd0d18a74863773530815
+# (git 99e7f13) was the 2026-05-06 ECR-mirror rollback built
+# pre-suspension from GitHub and NEVER rebuilt post-suspension because
+# this workflow did not exist. This file restores the build path so a
+# merge to main produces a fresh, T4-baked, list_peers-working image.
+#
+# Cross-repo `uses:` is BLOCKED on Gitea 1.22.6 (DEFAULT_ACTIONS_URL=
+# github → 404; feedback_gitea_cross_repo_uses_blocked) so the
+# publish-template-image logic is inlined.
+#
+# Registry: production uses ECR. The ECR repo
+# `molecule-ai/workspace-template-codex` already exists (the migration
+# sweep created it; that is where sha256:877e0687 lives today).
+#
+# Gitea 1.22.6 hostile-shape checklist applied:
+#   - No workflow_dispatch.inputs (silently rejected on 1.22.6)
+#   - No merge_group: trigger
+#   - No cross-repo uses:
+#   - GITHUB_SERVER_URL pinned at workflow level
+#   - No on.push.paths: (would permanently block path-excluded pushes)
+#   - timeout-minutes on every job
+#
+# Cascade signal: molecule-core/publish-runtime.yml fans out by
+# git-pushing an updated `.runtime-version` to this repo's main, which
+# trips `on: push: branches: [main]`. resolve-version reads it and
+# forwards it as the RUNTIME_VERSION docker build-arg.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+  ECR_REGISTRY: 153263036946.dkr.ecr.us-east-2.amazonaws.com
+  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/workspace-template-codex
+  AWS_DEFAULT_REGION: us-east-2
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-version:
+    name: Resolve runtime version
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      sha: ${{ steps.read.outputs.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: read
+        shell: bash
+        run: |
+          if [ -f .runtime-version ]; then
+            v="$(head -n1 .runtime-version | tr -d '[:space:]')"
+            echo "version=${v}" >> "$GITHUB_OUTPUT"
+            echo "resolved runtime version from .runtime-version: ${v}"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "no .runtime-version file — will use Dockerfile/requirements.txt pin"
+          fi
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          # Drift guard: the image pins runtime from .runtime-version (RUNTIME_VERSION build-arg).
+          # requirements.txt MUST agree, or a requirements-only bump silently ships the old runtime
+          # (root cause of the 2026-05-31 codex chat regression — PR#69 bumped only requirements.txt).
+          if [ -f .runtime-version ] && [ -f requirements.txt ]; then
+            req="$(grep -E '^molecule-ai-workspace-runtime==' requirements.txt | head -n1 | sed -E 's/.*==//' | tr -d '[:space:]')"
+            if [ -n "${req}" ] && [ "${req}" != "${v:-}" ]; then
+              echo "::error::.runtime-version (${v:-<unset>}) != requirements.txt pin (${req}). Bump BOTH — the image pins from .runtime-version."
+              exit 1
+            fi
+            echo "runtime-version/requirements pin agree: ${v:-} == ${req:-<none>}"
+          fi
+
+  publish:
+    name: Build & push workspace-template-codex image
+    # Pin to the dedicated Linux publish runners (label "publish" →
+    # molecule-runner-publish-1/2). MUST NOT use `ubuntu-latest`: that
+    # label is also advertised by the Windows/WSL self-hosted runners
+    # (hongming-pc-runner-*, "C:\Users\qz154\.cache\act"), so the
+    # docker-build/push job landed non-deterministically on a Windows
+    # runner where `aws ecr get-login-password | docker login
+    # --password-stdin` fails with "protocol not available" (Docker
+    # credential store/helper unusable in that act/WSL context). This is
+    # placement-dependent, NOT a transient flake — runs 79610 (commit
+    # 2d54d260, task 127304, hongming-pc-runner-2) and 78342 (283f371,
+    # hongming-pc-runner-3) both failed there; Linux-runner builds
+    # (78300/78302) succeeded. Mirrors the org convention used by every
+    # molecule-core docker build/push job (publish-workspace-server-image
+    # .yml / publish-runtime.yml / publish-canvas-image.yml: `runs-on:
+    # publish`).
+    # AND-of-labels: `publish` is also advertised by some
+    # hongming-pc-runner-publish-* runners (Windows), whose runner-base
+    # image (`docker-config-fix`) breaks `docker login --password-stdin`
+    # with `Error saving credentials: mkdir /home/hongming: permission
+    # denied` (task #280 close-out, 2026-05-19 publish-image run 79 job 1).
+    # op-host molecule-runner-publish-{1,2} are the only runners advertising
+    # BOTH `publish` AND `release` (op-host /opt/molecule/runners/
+    # config.publish.yaml lines 28-29). Requiring both labels routes
+    # publish to op-host deterministically.
+    runs-on: [publish, release]
+    timeout-minutes: 30
+    needs: resolve-version
+    # Bubble the Push step's digest to the job level so the downstream
+    # `promote-pin` job can consume `needs.publish.outputs.digest`. Without
+    # this block the expression resolves to "" at runtime — job-level outputs
+    # are the canonical Gitea/GHA mechanism for surfacing a step output across
+    # a `needs:` edge (`steps.push.outputs.digest` is only visible WITHIN this
+    # job). Mirrors the claude-code / hermes sibling templates.
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Lint — no bare imports of runtime modules
+        shell: bash
+        run: |
+          set -eu
+          FALLBACK_MODULES='plugins|adapter_base|config|main|preflight|prompt|coordinator|consolidation|events|heartbeat|transcript_auth|runtime_wedge|watcher|skill_loader|policies|adapters|builtin_tools|executor_helpers|a2a_executor|a2a_client|a2a_tools|a2a_cli|a2a_mcp_server|agent|agents_md|initial_prompt|molecule_ai_status|platform_auth|configs_dir|shared_runtime'
+          RUNTIME_MODULES=""
+          mkdir -p /tmp/runtime-wheel
+          if pip download --quiet molecule-ai-workspace-runtime --no-deps -d /tmp/runtime-wheel 2>/dev/null; then
+            WHEEL=$(ls /tmp/runtime-wheel/*.whl 2>/dev/null | head -1)
+            if [ -n "$WHEEL" ]; then
+              RUNTIME_MODULES=$(unzip -p "$WHEEL" molecule_runtime/_runtime_modules.json 2>/dev/null \
+                | python3 -c "import sys,json; m=json.load(sys.stdin); print('|'.join(sorted(set(m['top_level_modules']) | set(m['subpackages']))))" 2>/dev/null || echo "")
+            fi
+          fi
+          if [ -n "$RUNTIME_MODULES" ]; then
+            echo "::notice::lint module list from published wheel"
+          else
+            RUNTIME_MODULES="$FALLBACK_MODULES"
+            echo "::warning::could not read _runtime_modules.json from wheel — using inline fallback"
+          fi
+          if HITS=$(grep -nE "^\s*from (${RUNTIME_MODULES}) import" *.py 2>/dev/null); then
+            echo "::error::Bare imports of runtime modules found — use 'from molecule_runtime.<module> import'"
+            echo "$HITS" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "::notice::no bare imports of runtime modules in *.py files"
+
+      - name: Log in to ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Verify Docker daemon access
+        run: |
+          set -euo pipefail
+          docker info >/dev/null 2>&1 || {
+            echo "::error::Docker daemon is not accessible — check runner sock mount"
+            exit 1
+          }
+          echo "Docker daemon OK"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Ensure ECR repository exists
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          repo_path="${IMAGE_NAME#*/}"
+          repo_path="${repo_path#*/}"  # → molecule-ai/workspace-template-codex
+          if ! aws ecr describe-repositories --repository-names "${repo_path}" --region us-east-2 >/dev/null 2>&1; then
+            aws ecr create-repository \
+              --repository-name "${repo_path}" \
+              --image-scanning-configuration scanOnPush=true \
+              --region us-east-2 >/dev/null
+            echo "::notice::created ECR repository ${repo_path}"
+          else
+            echo "ECR repository ${repo_path} already exists"
+          fi
+
+      - name: Build image (load for smoke test, do not push yet)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          build-args: |
+            RUNTIME_VERSION=${{ needs.resolve-version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Molecule AI workspace template — codex runtime
+
+      - name: Smoke test — import every /app/*.py
+        shell: bash
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+        run: |
+          set -eu
+          docker run --rm \
+            -e WORKSPACE_ID=smoke-test \
+            -e OPENAI_API_KEY=sk-fake-smoke-key \
+            -e MINIMAX_API_KEY=sk-fake-smoke-key \
+            --entrypoint sh "${IMAGE}" -c '
+            set -e
+            cd /app
+            for f in *.py; do
+              [ "$f" = "__init__.py" ] && continue
+              mod="${f%.py}"
+              python3 -c "import $mod" || { echo "::error::failed to import $mod"; exit 1; }
+              echo "  import $mod OK"
+            done
+          '
+          echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
+
+      - name: Push image to ECR (post-smoke)
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          build-args: |
+            RUNTIME_VERSION=${{ needs.resolve-version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Molecule AI workspace template — codex runtime
+
+      # NOTE: the old "Surface pushed digest as commit status (operator
+      # promotes)" step was DELETED here (keystone pipeline fix). It POSTed a
+      # `runtime-image/pushed-digest` commit status with the auto-injected
+      # `secrets.GITEA_TOKEN` and was `continue-on-error: true`. On Gitea
+      # 1.22.x that POST 403s ("user should be the owner of the repo" — the
+      # Actions token is not a repo owner/collaborator with status-write), and
+      # because the step swallowed the 403 the build went GREEN while NO pin
+      # was ever promoted. There was also NO downstream watcher anywhere that
+      # consumed `runtime-image/pushed-digest`, so even a 201 would have been a
+      # no-op. Result: every codex publish since this repo's pipeline was
+      # restored left runtime_image_pins[codex] STALE, so reprovisions kept
+      # pulling the old #77 sandbox image and the #82 bwrap fix never shipped.
+      # The promote is now a real CP-admin POST (promote-pin job below, the
+      # proven claude-code / hermes RFC internal#529 Layer A pattern), and a
+      # fail-loud verify-pin gate asserts the pin actually moved.
+
+  promote-pin:
+    # RFC internal#529 Layer A — auto-promote the just-pushed digest to
+    # runtime_image_pins via the control-plane admin endpoint. Gitea 1.22.x
+    # has no `workflow_run`, so promotion has to be a job in this same
+    # workflow (cannot be a separate workflow listening on publish-image
+    # success). Gated on `if: success()` so a failed publish (smoke red,
+    # push red) never bumps any pin — promotion only runs AFTER a green
+    # build/push.
+    #
+    # Dual-environment fan-out: staging CP `runtime_image_pins` is a SEPARATE
+    # SSOT from prod, so the `E2E Staging SaaS` canary boots whatever staging's
+    # pin points at. We promote to BOTH prod (api.moleculesai.app) and staging
+    # (staging-api.moleculesai.app). `strategy.fail-fast: false` makes each
+    # matrix leg independent — a prod-promote failure does NOT cancel/block the
+    # staging-promote and vice-versa — but each leg is still fail-LOUD on a
+    # non-2xx for ITS OWN target so a stranded pin is never hidden behind a
+    # green workflow. Mirrors molecule-ai-workspace-template-claude-code and
+    # -hermes byte-for-byte except TEMPLATE_NAME=codex.
+    name: Promote runtime_image_pins (CP admin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [resolve-version, publish]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env_name: prod
+            cp_host: api.moleculesai.app
+          - env_name: staging
+            cp_host: staging-api.moleculesai.app
+    steps:
+      - name: POST /cp/admin/runtime-image/promote (${{ matrix.env_name }})
+        env:
+          PROD_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+          STAGING_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN_STAGING }}
+          ENV_NAME: ${{ matrix.env_name }}
+          CP_HOST: ${{ matrix.cp_host }}
+          TEMPLATE_NAME: codex
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+          GIT_SHA: ${{ needs.resolve-version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${ENV_NAME}" = "prod" ]; then
+            CP_ADMIN_API_TOKEN="${PROD_TOKEN}"
+            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN"
+          else
+            CP_ADMIN_API_TOKEN="${STAGING_TOKEN}"
+            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN_STAGING"
+          fi
+          if [ -z "${CP_ADMIN_API_TOKEN}" ]; then
+            echo "::error::${TOKEN_SECRET_NAME} secret not configured on this repo — cannot promote ${ENV_NAME} pin"
+            exit 1
+          fi
+          if [ -z "${IMAGE_DIGEST}" ]; then
+            echo "::error::needs.publish.outputs.digest is empty — Push step did not expose digest"
+            exit 1
+          fi
+          body=$(printf '{"template_name":"%s","image_digest":"%s","git_sha":"%s","notes":"auto-promote via publish-image.yml @ %s -> %s"}' \
+            "${TEMPLATE_NAME}" "${IMAGE_DIGEST}" "${GIT_SHA}" "${GITHUB_SHA}" "${ENV_NAME}")
+          echo "::notice::POST runtime-image/promote env=${ENV_NAME} host=${CP_HOST} template=${TEMPLATE_NAME} digest=${IMAGE_DIGEST} git_sha=${GIT_SHA}"
+          # Capture body + status separately; fail-loud on non-2xx so a silent
+          # 4xx never strands the pin behind a green workflow.
+          resp=$(mktemp)
+          code=$(curl -sS -o "${resp}" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${CP_ADMIN_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${body}" \
+            "https://${CP_HOST}/cp/admin/runtime-image/promote")
+          echo "HTTP ${code}"
+          cat "${resp}"
+          echo
+          if [ "${code}" != "200" ] && [ "${code}" != "201" ]; then
+            echo "::error::${ENV_NAME} promote failed (HTTP ${code})"
+            exit 1
+          fi
+          echo "::notice::${ENV_NAME} runtime_image_pins.${TEMPLATE_NAME} bumped to ${IMAGE_DIGEST}"
+
+  verify-pin:
+    # Keystone fail-loud gate (the durable guard the CTO asked for). After the
+    # promote, READ BACK runtime_image_pins via GET /cp/admin/runtime-image and
+    # ASSERT the (codex, global) row's image_digest == the digest we just
+    # pushed. If they differ (promote silently skipped, wrong template, region
+    # skew, 4xx that somehow didn't abort, etc.) this job goes RED. This is the
+    # thing the old continue-on-error status-post could never do: it makes a
+    # missed promote impossible to hide behind a green build. Runs per
+    # environment (prod + staging) with the same isolation semantics as
+    # promote-pin. A shared, reusable copy of this gate lives in
+    # .gitea/scripts/verify-runtime-pin.sh in EVERY runtime template repo so the
+    # guard covers codex/claude-code/hermes/etc., not just codex.
+    name: Verify runtime_image_pins moved (fail-loud)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [resolve-version, publish, promote-pin]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env_name: prod
+            cp_host: api.moleculesai.app
+            token_secret: CP_ADMIN_API_TOKEN
+          - env_name: staging
+            cp_host: staging-api.moleculesai.app
+            token_secret: CP_ADMIN_API_TOKEN_STAGING
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Verify runtime_image_pins[ codex, ${{ matrix.env_name }} ]
+        env:
+          CP_HOST: ${{ matrix.cp_host }}
+          CP_ADMIN_API_TOKEN: ${{ secrets[matrix.token_secret] }}
+          TEMPLATE_NAME: codex
+          EXPECTED_DIGEST: ${{ needs.publish.outputs.digest }}
+          ENV_NAME: ${{ matrix.env_name }}
+          TOKEN_SECRET_NAME: ${{ matrix.token_secret }}
+        run: bash .gitea/scripts/verify-runtime-pin.sh

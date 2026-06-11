@@ -35,6 +35,119 @@ async def test_initialize_handshake() -> None:
 
 
 @pytest.mark.asyncio
+async def test_initialize_sends_initialized_notification() -> None:
+    """``initialize`` must be followed by an ``initialized`` notification.
+
+    Per codex app-server protocol contract — without this notification,
+    codex 0.130+ silently rejects every subsequent request with
+    "Not initialized". Regression guard for internal#659 P1#1.
+    """
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        # Ask the mock what notifications it received from us.
+        seen = await proc.request("get_received_notifications", {})
+        assert "initialized" in seen["methods"], (
+            f"client did not send `initialized` notification; mock saw: {seen['methods']}"
+        )
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_writes_no_id_message() -> None:
+    """``notify`` must produce a JSON-RPC message with no ``id`` field."""
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        # Send a custom notification; mock records it.
+        await proc.notify("custom_event", {"x": 1})
+        seen = await proc.request("get_received_notifications", {})
+        # `initialized` (auto-sent) + `custom_event` (manual) should both be present.
+        assert "initialized" in seen["methods"]
+        assert "custom_event" in seen["methods"]
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_elicitation_request_auto_accepted() -> None:
+    """Server-initiated `mcpServer/elicitation/request` must auto-accept.
+
+    Codex 0.130 sends this method to ask permission for MCP tool calls.
+    Without a response, the active turn wedges and times out at 600s with
+    `codex turn ... wedged: no events for 90s` — the post-PR#48 symptom
+    observed live on CR2 + Researcher 2026-05-24. Regression guard.
+    """
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        # Ask the mock to send a server→client elicitation request.
+        resp = await proc.request("send_inbound_request", {
+            "req_method": "mcpServer/elicitation/request",
+            "req_id": 12345,
+            "req_params": {
+                "threadId": "test-thread",
+                "turnId": "test-turn",
+                "serverName": "molecule",
+                "mode": "form",
+                "message": "Allow tool inbox_peek?",
+                "_meta": {"codex_approval_kind": "mcp_tool_call"},
+            },
+        })
+        # Client should have answered with action=accept (default policy).
+        client_response = resp["client_response"]
+        assert client_response == {"action": "accept", "content": {}}, (
+            f"expected auto-accept, got {client_response!r}"
+        )
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_unknown_request_auto_declined() -> None:
+    """Unknown inbound request methods must auto-decline (not hang)."""
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        resp = await proc.request("send_inbound_request", {
+            "req_method": "some/unknown/method",
+            "req_id": 99001,
+            "req_params": {},
+        })
+        # Default policy: decline, content=None.
+        assert resp["client_response"] == {"action": "decline", "content": None}
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_inbound_request_handler_override() -> None:
+    """Caller can register a custom handler that overrides default policy."""
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+        seen_params: dict = {}
+
+        async def handler(method: str, params: dict) -> dict:
+            seen_params["method"] = method
+            seen_params["params"] = params
+            return {"action": "accept", "content": {"custom": True}}
+
+        proc.set_inbound_request_handler("mcpServer/elicitation/request", handler)
+        resp = await proc.request("send_inbound_request", {
+            "req_method": "mcpServer/elicitation/request",
+            "req_id": 88001,
+            "req_params": {"hello": "world"},
+        })
+        assert seen_params["method"] == "mcpServer/elicitation/request"
+        assert seen_params["params"] == {"hello": "world"}
+        assert resp["client_response"] == {"action": "accept", "content": {"custom": True}}
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
 async def test_request_response_correlation() -> None:
     """Concurrent requests should not cross responses."""
     proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
@@ -122,3 +235,89 @@ async def test_request_after_close_raises() -> None:
     await proc.close()
     with pytest.raises(ConnectionError):
         await proc.request("echo", {"text": "x"})
+
+
+@pytest.mark.asyncio
+async def test_eof_fails_pending_requests() -> None:
+    """Stdout EOF on a still-alive child must fail every pending request.
+
+    Regression for the 2026-05-18 prod-Reviewer/Researcher wedge: the
+    codex CLI closed its stdout pipe mid-conversation while the
+    process itself stayed alive (parked in epoll). Pre-fix
+    AppServerProcess._read_loop returned cleanly on EOF without
+    setting _reader_exc — any subsequent request() blocked on a future
+    that would never resolve until the 600 s request timeout. Post-fix
+    EOF sets _reader_exc and fails every pending future immediately.
+    """
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+
+        # Ask the mock to close stdout, then verify a subsequent
+        # request fails fast with ConnectionError (NOT a timeout).
+        await proc.request("close_stdout_after", {})
+
+        # Give the reader a moment to notice EOF.
+        await asyncio.sleep(0.1)
+
+        with pytest.raises(ConnectionError) as ei:
+            # 5s is plenty for the mark-dead path to trip; pre-fix
+            # this would wait the full default request timeout.
+            await proc.request("echo", {"text": "after-eof"}, timeout=5.0)
+        assert "EOF" in str(ei.value) or "stdout" in str(ei.value)
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_in_flight_request_fails_on_eof() -> None:
+    """A future already-pending when EOF arrives must fail, not hang."""
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+
+        # Issue a request whose response will never come because we'll
+        # close the stdout pipe in the SAME mock invocation. The mock's
+        # close_stdout_after acks first then closes, so the only way
+        # to test mid-flight failure is to issue a separate slow
+        # request alongside.
+        slow = asyncio.create_task(
+            proc.request("echo", {"text": "x", "delay_ms": 5000}, timeout=10.0)
+        )
+        # Yield long enough for the slow echo to be registered in
+        # _pending and written to stdin.
+        await asyncio.sleep(0.05)
+
+        # Close stdout — slow's pending future must fail.
+        await proc.request("close_stdout_after", {})
+
+        with pytest.raises(ConnectionError):
+            await slow
+    finally:
+        await proc.close()
+
+
+@pytest.mark.asyncio
+async def test_child_crash_fails_pending_requests() -> None:
+    """Child process exit must fail pending requests via the watcher.
+
+    Even if the reader missed EOF (parked in readuntil) the
+    _watch_child task awaits proc.wait() and on completion fails any
+    still-pending requests with ConnectionError. Covers OS-level
+    crashes (SIGKILL, segfault) that the reader-EOF path might race.
+    """
+    proc = await AppServerProcess.start(executable=sys.executable, args=(_MOCK,))
+    try:
+        await proc.initialize(client_info={"name": "test", "version": "0"})
+
+        # Ask the mock to crash. The ack arrives before the exit; the
+        # next request must fail fast.
+        await proc.request("crash_after", {})
+        # Give the child a moment to actually exit and the watcher to
+        # mark the channel dead.
+        await asyncio.sleep(0.3)
+
+        with pytest.raises(ConnectionError):
+            await proc.request("echo", {"text": "after-crash"}, timeout=5.0)
+    finally:
+        await proc.close()
