@@ -704,3 +704,104 @@ async def test_execute_timeout_resets_app_server_for_next_turn() -> None:
     assert ex._app_server is None
     assert ex._thread_id is None
     assert ex._current_turn_id is None
+
+
+# ---------------------------------------------------------------------------
+# Docs-drift guard: the _await_turn_completion docstring + config.yaml
+# narrative must reflect the real _TURN_TIMEOUT / _TURN_INACTIVITY_TIMEOUT
+# constants. Replaces the stale "90s inactivity / 600s turn" copy that
+# pre-dated the CTO 2026-06-07 bump (RFC: see molecule-ai/internal#781).
+#
+# The guard is intentionally narrow: it scans ONLY the _await_turn_completion
+# docstring + the executor-timeout narrative block in config.yaml — NOT
+# the entire repo — so historical references to the old 90s/600s caps in
+# code comments / incident writeups (e.g. the 2026-05-18 production wedge
+# in executor.py:62 and app_server.py:507) stay valid.
+# ---------------------------------------------------------------------------
+
+
+def _await_turn_completion_docstring() -> str:
+    """Return the docstring of _await_turn_completion (empty if missing)."""
+    fn = getattr(CodexAppServerExecutor, "_await_turn_completion", None)
+    if fn is None:
+        return ""
+    return (fn.__doc__ or "")
+
+
+def test_await_turn_completion_docstring_matches_inactivity_constant():
+    """The docstring must state _TURN_INACTIVITY_TIMEOUT = 300s, not the old 90s."""
+    import re
+
+    doc = _await_turn_completion_docstring()
+    expected = f"_TURN_INACTIVITY_TIMEOUT`` ({int(_TURN_INACTIVITY_TIMEOUT)} s)"
+    assert expected in doc, (
+        f"docstring for _await_turn_completion is stale: expected to find "
+        f"{expected!r} (mirroring the live _TURN_INACTIVITY_TIMEOUT = "
+        f"{_TURN_INACTIVITY_TIMEOUT}), but docstring was:\n{doc}"
+    )
+    # And the obsolete "(90 s)" copy must not be present anywhere in the
+    # docstring.
+    assert "(90 s)" not in doc, (
+        "docstring still contains the stale '(90 s)' inactivity copy; "
+        "regenerate from the live _TURN_INACTIVITY_TIMEOUT constant."
+    )
+
+
+def test_await_turn_completion_docstring_matches_turn_timeout_constant():
+    """The docstring must state _TURN_TIMEOUT = 3600s, not the old 600s."""
+    import executor as exec_mod
+    from executor import _TURN_TIMEOUT
+
+    doc = _await_turn_completion_docstring()
+    expected = f"_TURN_TIMEOUT`` ({int(_TURN_TIMEOUT)} s)"
+    assert expected in doc, (
+        f"docstring for _await_turn_completion is stale: expected to find "
+        f"{expected!r} (mirroring the live _TURN_TIMEOUT = {_TURN_TIMEOUT}), "
+        f"but docstring was:\n{doc}"
+    )
+    # And the obsolete "(600 s)" copy must not be present anywhere in the
+    # docstring.
+    assert "(600 s)" not in doc, (
+        "docstring still contains the stale '(600 s)' turn copy; "
+        "regenerate from the live _TURN_TIMEOUT constant."
+    )
+
+
+def test_config_yaml_executor_timeout_narrative_matches_constant(tmp_path):
+    """config.yaml's executor-timeout narrative must reflect _TURN_TIMEOUT (3600s).
+
+    In this template, the executor block lives under ``runtime_config:``
+    (not at the top level). We scan the entire file for the narrative
+    string and assert both:
+      - the live _TURN_TIMEOUT value is mentioned
+      - the obsolete "currently 600s" copy is gone
+    """
+    import executor as exec_mod
+    from executor import _TURN_TIMEOUT
+
+    config_yaml = (Path(__file__).resolve().parent.parent / "config.yaml").read_text()
+
+    # Look for the narrative anchor line and the surrounding paragraph
+    # so we can assert in-context (not just any "3600" mention).
+    narrative_anchor = "Per-turn timeout is enforced inside"
+    anchor_idx = config_yaml.find(narrative_anchor)
+    assert anchor_idx != -1, (
+        "config.yaml is missing the 'Per-turn timeout is enforced inside' "
+        "narrative block; if you moved/renamed it, update this guard."
+    )
+    # Take the next ~5 lines (the narrative paragraph that mentions
+    # _TURN_TIMEOUT) — enough to cover the comment but bounded.
+    narrative_paragraph = config_yaml[anchor_idx:anchor_idx + 800]
+
+    expected_seconds = int(_TURN_TIMEOUT)
+    assert f"{expected_seconds}s" in narrative_paragraph, (
+        f"config.yaml executor-timeout narrative does not mention "
+        f"_TURN_TIMEOUT = {expected_seconds}s. Drift — update the narrative "
+        f"or run the docs-drift guard manually. Narrative was:\n"
+        f"{narrative_paragraph}"
+    )
+    assert "currently 600s" not in narrative_paragraph, (
+        "config.yaml executor-timeout narrative still contains the stale "
+        "'currently 600s' copy; update to the live _TURN_TIMEOUT value "
+        f"({expected_seconds}s)."
+    )

@@ -210,7 +210,8 @@ runtime_config:
     - minimax-token-plan
 
   # 0 = no executor-side timeout. Per-turn timeout is enforced inside
-  # executor.py at _TURN_TIMEOUT (currently 600s).
+  # executor.py at _TURN_TIMEOUT (currently 3600s); the inactivity
+  # watchdog (_TURN_INACTIVITY_TIMEOUT, 300s) is the primary bound.
   timeout: 0
 
 # codex's tool set is built-in (file ops, terminal, apply_patch, web
