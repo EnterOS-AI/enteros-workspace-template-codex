@@ -579,7 +579,7 @@ class CodexAppServerExecutor(AgentExecutor):
 
         Stacked bounds:
 
-        - ``_TURN_INACTIVITY_TIMEOUT`` (90 s) — max gap between events.
+        - ``_TURN_INACTIVITY_TIMEOUT`` (300 s) — max gap between events.
           A healthy turn emits ``codex/event/*`` notifications
           continuously; a wedged channel emits zero. If the activity
           counter does not advance for this long, we raise
@@ -589,7 +589,7 @@ class CodexAppServerExecutor(AgentExecutor):
           turn-lock for 10 minutes per stuck request, masking the
           real channel failure.
 
-        - ``_TURN_TIMEOUT`` (600 s) — hard upper bound for total turn
+        - ``_TURN_TIMEOUT`` (3600 s) — hard upper bound for total turn
           duration even if events keep arriving. Preserves the
           previous-generation bound for legitimately-long tool-use
           turns (test runs, etc.).
