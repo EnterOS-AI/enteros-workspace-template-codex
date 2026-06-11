@@ -157,22 +157,22 @@ runtime_config:
   models:
     - id: gpt-5.5
       name: GPT-5.5 (OpenAI subscription or API key)
-      required_env: [OPENAI_API_KEY]
+      required_env: [OPENAI_API_KEY, CODEX_AUTH_JSON]
     - id: gpt-5.4
       name: GPT-5.4 (OpenAI subscription or API key)
-      required_env: [OPENAI_API_KEY]
+      required_env: [OPENAI_API_KEY, CODEX_AUTH_JSON]
     - id: gpt-5.4-mini
       name: GPT-5.4 mini (OpenAI subscription or API key)
-      required_env: [OPENAI_API_KEY]
+      required_env: [OPENAI_API_KEY, CODEX_AUTH_JSON]
     - id: gpt-5.3-codex
       name: GPT-5.3 Codex (OpenAI subscription or API key)
-      required_env: [OPENAI_API_KEY]
+      required_env: [OPENAI_API_KEY, CODEX_AUTH_JSON]
     - id: gpt-5.3-codex-spark
       name: GPT-5.3 Codex Spark (OpenAI subscription or API key)
-      required_env: [OPENAI_API_KEY]
+      required_env: [OPENAI_API_KEY, CODEX_AUTH_JSON]
     - id: gpt-5.2
       name: GPT-5.2 (OpenAI subscription or API key)
-      required_env: [OPENAI_API_KEY]
+      required_env: [OPENAI_API_KEY, CODEX_AUTH_JSON]
 
     # MiniMax token-plan codex route — public endpoint
     # (api.minimax.io). See `providers:` registry note on the
@@ -198,8 +198,9 @@ runtime_config:
 
   # Default required_env — the canvas surfaces this when no model is
   # picked. OPENAI_API_KEY is the documented direct path; subscription
-  # and MiniMax paths are validated by the adapter via the registry.
-  required_env: [OPENAI_API_KEY]
+  # (via CODEX_AUTH_JSON / auth.json at ~/.codex/) and MiniMax paths
+  # are validated by the adapter via the registry.
+  required_env: [OPENAI_API_KEY, CODEX_AUTH_JSON]
 
   # Provider names surfaced in the canvas Config tab dropdown. The
   # actual routing decision is made in adapter.setup() against the
