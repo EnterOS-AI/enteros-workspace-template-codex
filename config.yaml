@@ -209,6 +209,7 @@ runtime_config:
     - openai-subscription
     - openai-api
     - minimax-token-plan
+    - platform
 
   # 0 = no executor-side timeout. Per-turn timeout is enforced inside
   # executor.py at _TURN_TIMEOUT (currently 3600s); the inactivity
