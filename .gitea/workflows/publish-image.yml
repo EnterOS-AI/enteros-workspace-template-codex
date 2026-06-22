@@ -244,6 +244,21 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — codex runtime
 
+      # Keep the prod ECR storage bill bounded: declare the canonical image
+      # lifecycle policy on the repo we just pushed. Idempotent + fail-soft
+      # (never fails the publish). SSOT JSON lives in the script.
+      - name: Ensure ECR lifecycle policy
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -uo pipefail
+          # Strip the registry host; pass the bare molecule-ai/<repo> name.
+          REPO_NAME="${IMAGE_NAME#*/}"
+          bash scripts/ensure-ecr-lifecycle.sh "${REPO_NAME}"
+
       # NOTE: the old "Surface pushed digest as commit status (operator
       # promotes)" step was DELETED here (keystone pipeline fix). It POSTed a
       # `runtime-image/pushed-digest` commit status with the auto-injected
