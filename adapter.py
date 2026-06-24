@@ -267,6 +267,71 @@ class CodexAdapter(BaseAdapter):
             str(written) if written else "<no override>",
         )
 
+        # --- Plugin pipeline: render declared plugins into ~/.codex/config.toml ---
+        # Drive the base per-runtime plugin adaptor pipeline. For an MCP-server
+        # plugin (e.g. the privileged ``molecule-platform-mcp`` the concierge
+        # declares) this resolves to MCPServerAdaptor, which calls
+        # ``register_mcp_server_hook`` — our override below — to render the
+        # ``[mcp_servers.<name>]`` table into the codex config.toml the running
+        # CLI reads. Without this call the declared management MCP is NEVER
+        # written for codex, so a codex concierge boots without create_workspace
+        # (the #3159 class of bug — wired-to-a-file-the-runtime-never-reads, here
+        # specifically: not wired at all). Mirrors the claude-code adapter's
+        # ``install_plugins_via_registry`` call from its own setup().
+        from molecule_runtime.plugins import load_plugins
+        workspace_plugins_dir = os.path.join(config.config_path, "plugins")
+        plugins = load_plugins(
+            workspace_plugins_dir=workspace_plugins_dir,
+            shared_plugins_dir=os.environ.get("PLUGINS_DIR", "/plugins"),
+        )
+        await self.install_plugins_via_registry(config, plugins)
+
+    def register_mcp_server_hook(self, config, name, spec):
+        """Codex MCP-wiring PORT override: inject literal molecule-* env values.
+
+        Codex's MCP-child env whitelist (codex-rs/rmcp-client/src/utils.rs) only
+        forwards a small set (HOME / PATH / LANG / …) and DROPS the molecule-
+        specific runtime env — so an MCP server spawned by codex never inherits
+        ``MOLECULE_CP_URL`` / ``MOLECULE_ADMIN_TOKEN`` / ``PLATFORM_URL`` / etc.
+        from the parent process the way Claude Code's MCP child does. The
+        management MCP (``@molecule-ai/mcp-server``) reads MOLECULE_CP_URL +
+        MOLECULE_ADMIN_TOKEN to reach the controlplane; without them
+        create_workspace 401s/no-ops even though the server is declared.
+
+        Fix: resolve those values at install time and merge them as LITERALS
+        into the spec's ``env`` block before the base renderer writes the codex
+        ``[mcp_servers.<name>.env]`` sub-table — the exact pattern the hardcoded
+        ``[mcp_servers.molecule]`` a2a block uses for WORKSPACE_ID / PLATFORM_URL
+        (codex_mcp_config.sh). Values already present in the plugin descriptor's
+        env (e.g. MOLECULE_MCP_MODE) are preserved and win, so this only fills
+        the whitelist-dropped gaps. The base hook then dispatches on self.name()
+        == "codex" to render_codex_config (~/.codex/config.toml).
+        """
+        spec = dict(spec)
+        descriptor_env = dict(spec.get("env") or {})
+
+        # The molecule-* runtime env codex would otherwise drop. Only keys whose
+        # value is actually present in this process are injected (an empty string
+        # written into the TOML would shadow nothing useful and could confuse the
+        # MCP server's "is this configured?" checks). Descriptor-declared keys
+        # are NOT overwritten.
+        for key in (
+            "MOLECULE_CP_URL",
+            "MOLECULE_ADMIN_TOKEN",
+            "PLATFORM_URL",
+            "WORKSPACE_ID",
+            "MOLECULE_ORG_ID",
+        ):
+            if key in descriptor_env:
+                continue
+            val = os.environ.get(key)
+            if val:
+                descriptor_env[key] = val
+
+        if descriptor_env:
+            spec["env"] = descriptor_env
+        return super().register_mcp_server_hook(config, name, spec)
+
     async def create_executor(self, config: AdapterConfig):
         from executor import CodexAppServerExecutor
         return CodexAppServerExecutor(config)

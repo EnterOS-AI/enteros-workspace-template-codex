@@ -48,6 +48,14 @@ except ModuleNotFoundError:  # pragma: no cover - older local runtime
     async def append_image_descriptions(text, files):
         return text
 
+try:
+    from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
+except ImportError:  # pragma: no cover - older local runtime without #3082
+    # Newer runtime (core#3082) always provides this; the no-op fallback keeps
+    # loaded_mcp_tools capture from breaking a turn on an older base image.
+    def set_loaded_mcp_tools(_tools):  # type: ignore[misc]
+        return None
+
 from app_server import AppServerError, AppServerProcess
 
 logger = logging.getLogger(__name__)
@@ -108,6 +116,46 @@ class _TurnState:
     error: Exception | None = None
     turn_id: str | None = None
     activity: int = 0
+    # MCP tool ids (``mcp__<server>__<tool>``) observed live during this turn.
+    # The codex#3082 loaded_mcp_tools producer: codex has no claude-style "init
+    # tool list" message, so the only ground-truth signal that the management
+    # MCP's tools are actually LIVE (not merely declared in config.toml) is an
+    # MCP tool-call item the model emitted. Accumulated across the turn and
+    # published to the heartbeat producer in _run_turn's finally block.
+    mcp_tools: set = field(default_factory=set)
+
+
+def _mcp_tool_id_from_item(item: dict) -> str | None:
+    """Return ``mcp__<server>__<tool>`` for a codex MCP-tool-call item, else None.
+
+    codex#3082 producer. Codex's app-server emits an ``item/completed`` (or
+    bare ``item``) envelope when the model invokes an MCP tool. The exact item
+    schema has shifted across 0.72→0.130 patch releases (same churn that forced
+    the dual delta/completed handling above), so this reader is deliberately
+    tolerant of the field-name variants seen in the wild rather than pinned to
+    one shape:
+
+      * ``type`` in {mcp_tool_call, mcpToolCall} marks the MCP-tool item; the
+        server + tool names live under ``server``/``serverName`` and
+        ``tool``/``toolName``/``name``.
+      * Some patch builds nest these under ``item`` again — handled by the
+        caller passing the inner item.
+
+    Returns None for any non-MCP item (codex's own ``function_call`` builtin
+    tools, agent messages, reasoning, etc.) so only true MCP tools land in
+    ``loaded_mcp_tools`` — matching the ``mcp__`` prefix the claude-code
+    producer records and the gate consumes.
+    """
+    if not isinstance(item, dict):
+        return None
+    itype = item.get("type") or ""
+    if itype not in ("mcp_tool_call", "mcpToolCall"):
+        return None
+    server = item.get("server") or item.get("serverName") or ""
+    tool = item.get("tool") or item.get("toolName") or item.get("name") or ""
+    if not server or not tool:
+        return None
+    return f"mcp__{server}__{tool}"
 
 
 class CodexAppServerExecutor(AgentExecutor):
@@ -480,6 +528,12 @@ class CodexAppServerExecutor(AgentExecutor):
                     whole = item.get("message") or item.get("text") or ""
                     if whole and whole not in state.deltas:
                         state.deltas.append(whole)
+                # codex#3082: record MCP tool calls so the heartbeat can report
+                # loaded_mcp_tools (proves the management MCP's tools are LIVE,
+                # not merely declared in config.toml). No-op for non-MCP items.
+                tid = _mcp_tool_id_from_item(item)
+                if tid:
+                    state.mcp_tools.add(tid)
                 return
             if method == "turn/completed":
                 # 0.130's equivalent of `task_complete`. Codex emits
@@ -557,6 +611,16 @@ class CodexAppServerExecutor(AgentExecutor):
         finally:
             unsubscribe()
             self._current_turn_id = None
+            # codex#3082: publish the MCP tool ids observed this turn so the
+            # heartbeat reports loaded_mcp_tools and the platform online/degraded
+            # gate doesn't fail-closed a healthy codex concierge. A turn that
+            # ran but called no MCP tool publishes [] — itself a meaningful,
+            # non-None "a turn completed" signal (distinct from "no turn yet").
+            # Bookkeeping only; never let it raise into the turn result.
+            try:
+                set_loaded_mcp_tools(sorted(state.mcp_tools))
+            except Exception:  # noqa: BLE001
+                logger.debug("loaded_mcp_tools capture skipped", exc_info=True)
 
         if state.error:
             raise state.error
