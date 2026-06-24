@@ -307,6 +307,11 @@ jobs:
     needs: [validate-static, validate-runtime, t4-conformance, tests]
     if: always()
     timeout-minutes: 1
+    env:
+      # Fork-PR detection for the T4 hard-gate below. Only external fork PRs
+      # legitimately skip the live T4 probe; internal PRs and main pushes must
+      # run it to green.
+      IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
     steps:
       - name: Aggregate
         run: |
@@ -318,6 +323,8 @@ jobs:
           echo "validate-runtime: $runtime"
           echo "t4-conformance:   $t4"
           echo "tests:            $tests"
+          is_fork_pr="${IS_FORK_PR:-false}"
+          echo "is-fork-pr:       $is_fork_pr"
           if [ "$static" != "success" ]; then
             echo "::error::validate-static did not succeed: $static"
             exit 1
@@ -331,9 +338,13 @@ jobs:
           # (the `if:` fork guard short-circuits it). Any other
           # non-success fails the build: "verified" T4 requires this
           # live gate green, never inference.
-          if [ "$t4" != "success" ] && [ "$t4" != "skipped" ]; then
-            echo "::error::t4-conformance did not succeed: $t4 — T4 host-root reach / codex MCP token-ownership not verified on a live container. Failing closed (RFC internal#456 §11)."
-            exit 1
+          if [ "$t4" != "success" ]; then
+            if [ "$t4" = "skipped" ] && [ "$is_fork_pr" = "true" ]; then
+              echo "::notice::t4-conformance skipped on fork PR — allowing aggregate to pass."
+            else
+              echo "::error::t4-conformance did not succeed: $t4 — T4 host-root reach / codex MCP token-ownership not verified on a live container. Failing closed (RFC internal#456 §11)."
+              exit 1
+            fi
           fi
           if [ "$tests" != "success" ]; then
             echo "::error::Adapter unit tests did not succeed: $tests"
