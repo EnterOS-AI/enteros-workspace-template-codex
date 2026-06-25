@@ -286,6 +286,29 @@ class CodexAdapter(BaseAdapter):
         )
         await self.install_plugins_via_registry(config, plugins)
 
+        # --- SSOT: publish the single base-built system prompt onto config ---
+        # The codex executor consumes ``config.system_prompt`` as
+        # ``developerInstructions`` (executor.py). That field is BASE-OWNED and
+        # is None until something fills it. Build it HERE via the one canonical
+        # builder (``build_system_prompt``), which honors ``config.prompt_files``
+        # (with the legacy ``system-prompt.md`` fallback baked in) — so the codex
+        # concierge gets the SAME prompt-file resolution every other runtime
+        # gets, instead of an empty ``developerInstructions``. This closes the
+        # per-runtime prompt drift (the executor must never re-read
+        # /configs/system-prompt.md itself and ignore prompt_files). Plugin
+        # rules/prompts already loaded above are folded in so the assembled
+        # prompt matches the base ``_common_setup`` shape.
+        from molecule_runtime.prompt import build_system_prompt
+        config.system_prompt = build_system_prompt(
+            config.config_path,
+            config.workspace_id,
+            [],  # skills: codex does not load LangChain skills into the prompt
+            [],  # peers: fetched live per-turn by the platform tools, not baked
+            prompt_files=config.prompt_files,
+            plugin_rules=getattr(plugins, "rules", None),
+            plugin_prompts=list(getattr(plugins, "prompt_fragments", []) or []),
+        )
+
     def register_mcp_server_hook(self, config, name, spec):
         """Codex MCP-wiring PORT override: inject literal molecule-* env values.
 
