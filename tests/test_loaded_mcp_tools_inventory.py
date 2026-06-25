@@ -135,6 +135,40 @@ async def test_extract_loaded_mcp_tools_enumerates_fake_server(
 
 
 @pytest.mark.asyncio
+async def test_extract_loaded_mcp_tools_uses_codex_home_directly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """CODEX_HOME points at the .codex directory itself, not its parent.
+
+    start.sh and adapter.py both treat CODEX_HOME as the directory that
+    contains config.toml/auth.json. A path that doubled `.codex` would
+    silently return an empty inventory and re-introduce the #3082-class
+    regression this producer fixes.
+    """
+    codex_home = tmp_path / "codex-home-is-dot-codex"
+    codex_home.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    # Make sure HOME does not accidentally satisfy the path.
+    monkeypatch.setenv("HOME", str(tmp_path / "no-home"))
+
+    fake = _write_fake_server(tmp_path)
+    config = codex_home / "config.toml"
+    config.write_text(
+        f'[mcp_servers.molecule-platform]\n'
+        f'command = "{sys.executable}"\n'
+        f'args = ["{fake}"]\n'
+    )
+
+    # Path resolution must hit CODEX_HOME/config.toml exactly.
+    from executor import _codex_config_path
+    assert _codex_config_path() == config
+
+    tools = await extract_loaded_mcp_tools()
+    assert "mcp__molecule-platform__create_workspace" in tools
+    assert tools == sorted(tools)
+
+
+@pytest.mark.asyncio
 async def test_extract_loaded_mcp_tools_ignores_broken_server(
     tmp_path: Path, monkeypatch
 ) -> None:

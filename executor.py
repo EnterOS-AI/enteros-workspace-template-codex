@@ -170,9 +170,15 @@ def _codex_config_path() -> Path:
 
     Honors ``$CODEX_HOME`` so tests and multi-home deployments can
     isolate the file without touching the real ``~/.codex``.
+
+    ``CODEX_HOME`` is the ``.codex`` directory itself (matching start.sh
+    and adapter.py, which set/write ``$CODEX_HOME/config.toml`` and
+    ``$CODEX_HOME/auth.json``), not its parent. When unset, fall back to
+    ``~/.codex``.
     """
-    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~")
-    return Path(home) / ".codex" / "config.toml"
+    if "CODEX_HOME" in os.environ:
+        return Path(os.environ["CODEX_HOME"]) / "config.toml"
+    return Path(os.path.expanduser("~")) / ".codex" / "config.toml"
 
 
 def _read_codex_mcp_servers(config_path: Path | None = None) -> dict[str, dict]:
