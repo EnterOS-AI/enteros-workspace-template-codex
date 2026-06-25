@@ -227,3 +227,108 @@ def test_mcp_tool_id_from_item():
     # Malformed / partial → None (never a half-built id).
     assert _mcp_tool_id_from_item({"type": "mcp_tool_call"}) is None
     assert _mcp_tool_id_from_item(None) is None
+
+
+# --- System-prompt SSOT (task #76) -----------------------------------------
+# The codex executor consumes ``config.system_prompt`` as
+# ``developerInstructions`` (executor.py, already pinned by
+# test_executor.py::...developerInstructions). These two tests pin the OTHER
+# half: ``adapter.setup()`` must PUBLISH that field via the single base builder
+# (``build_system_prompt``), which honors ``config.prompt_files``. Before this
+# fix codex never called the builder, so ``config.system_prompt`` stayed None
+# and the concierge booted with an EMPTY developerInstructions — the identity-
+# less concierge bug. The invariant: ONE source (build_system_prompt honoring
+# prompt_files), never a per-runtime re-read of /configs/system-prompt.md that
+# ignores prompt_files.
+
+
+def _make_concierge_configs(tmp_path):
+    """A concierge layout: identity at prompts/concierge.md (declared via
+    prompt_files) with a STALE root system-prompt.md that must NOT shadow it."""
+    configs = tmp_path / "configs"
+    (configs / "prompts").mkdir(parents=True)
+    (configs / "prompts" / "concierge.md").write_text("ORG-CONCIERGE-IDENTITY")
+    (configs / "system-prompt.md").write_text("STALE-GENERIC-FALLBACK")
+    return configs
+
+
+@pytest.mark.asyncio
+async def test_setup_publishes_system_prompt_honoring_prompt_files(
+    monkeypatch, tmp_path
+):
+    """setup() fills config.system_prompt from the declared prompt_files, not a
+    blind system-prompt.md re-read."""
+    if not shutil.which("codex"):
+        pytest.skip("codex binary not on PATH (container-only check)")
+
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    monkeypatch.delenv("MOLECULE_LLM_BILLING_MODE", raising=False)
+    monkeypatch.setenv("PLUGINS_DIR", str(tmp_path / "no-shared-plugins"))
+
+    configs = _make_concierge_configs(tmp_path)
+
+    from adapter import CodexAdapter
+    from molecule_runtime.adapters.base import AdapterConfig
+
+    cfg = AdapterConfig(
+        model="gpt-5.5",
+        config_path=str(configs),
+        workspace_id="ws-codex-concierge",
+        prompt_files=["prompts/concierge.md"],
+    )
+    await CodexAdapter().setup(cfg)
+
+    assert cfg.system_prompt, "setup() left config.system_prompt empty"
+    # The declared prompt file is loaded...
+    assert "ORG-CONCIERGE-IDENTITY" in cfg.system_prompt
+    # ...and the stale single-file fallback is NOT (prompt_files wins — the
+    # exact drift that left the concierge identity-less).
+    assert "STALE-GENERIC-FALLBACK" not in cfg.system_prompt
+    # The base platform identity frame is always present (single builder).
+    assert "Molecule AI platform" in cfg.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_executor_forwards_published_prompt_as_developer_instructions(
+    monkeypatch, tmp_path
+):
+    """End-to-end: the prompt setup() published is exactly what the codex
+    executor sends as developerInstructions — no second source."""
+    if not shutil.which("codex"):
+        pytest.skip("codex binary not on PATH (container-only check)")
+
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    monkeypatch.delenv("MOLECULE_LLM_BILLING_MODE", raising=False)
+    monkeypatch.setenv("PLUGINS_DIR", str(tmp_path / "no-shared-plugins"))
+
+    configs = _make_concierge_configs(tmp_path)
+
+    from adapter import CodexAdapter
+    from executor import CodexAppServerExecutor
+    from molecule_runtime.adapters.base import AdapterConfig
+
+    cfg = AdapterConfig(
+        model="gpt-5.5",
+        config_path=str(configs),
+        workspace_id="ws-codex-concierge",
+        prompt_files=["prompts/concierge.md"],
+    )
+    adapter = CodexAdapter()
+    await adapter.setup(cfg)
+    executor = await adapter.create_executor(cfg)
+
+    # The executor holds the SAME AdapterConfig instance, so the prompt it
+    # forwards is precisely what setup() published — proving a single source.
+    assert isinstance(executor, CodexAppServerExecutor)
+    assert executor._config.system_prompt == cfg.system_prompt
+    assert "ORG-CONCIERGE-IDENTITY" in executor._config.system_prompt
