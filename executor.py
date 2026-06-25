@@ -28,9 +28,12 @@ dispatch, notification accumulation, error surface.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from a2a.helpers import new_text_message
@@ -47,6 +50,14 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - older local runtime
     async def append_image_descriptions(text, files):
         return text
+
+try:
+    from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
+except ImportError:  # pragma: no cover - older local runtime without #3082
+    # Newer runtime (core#3082) always provides this; the no-op fallback keeps
+    # loaded_mcp_tools capture from breaking a turn on an older base image.
+    def set_loaded_mcp_tools(_tools):  # type: ignore[misc]
+        return None
 
 from app_server import AppServerError, AppServerProcess
 
@@ -88,6 +99,12 @@ _TURN_INACTIVITY_TIMEOUT = 300.0  # raised from 90s: long active tool-use
 _INITIALIZE_TIMEOUT = 30.0
 _THREAD_START_TIMEOUT = 30.0
 
+# MCP stdio enumeration timeouts. We list tools from each configured MCP
+# server once per turn so ``loaded_mcp_tools`` reports the actual loaded
+# inventory independent of whether the current turn invokes any tool.
+_MCP_HANDSHAKE_TIMEOUT = 10.0
+_MCP_PROTOCOL_VERSION = "2024-11-05"
+
 
 @dataclass
 class _TurnState:
@@ -108,6 +125,247 @@ class _TurnState:
     error: Exception | None = None
     turn_id: str | None = None
     activity: int = 0
+    # MCP tool ids (``mcp__<server>__<tool>``) observed live during this turn.
+    # Kept as auxiliary input to ``loaded_mcp_tools``: if inventory
+    # enumeration from the config file fails, a tool that the model DID
+    # invoke this turn still proves that server is live.
+    mcp_tools: set = field(default_factory=set)
+
+
+def _mcp_tool_id_from_item(item: dict) -> str | None:
+    """Return ``mcp__<server>__<tool>`` for a codex MCP-tool-call item, else None.
+
+    codex#3082 producer. Codex's app-server emits an ``item/completed`` (or
+    bare ``item``) envelope when the model invokes an MCP tool. The exact item
+    schema has shifted across 0.72→0.130 patch releases (same churn that forced
+    the dual delta/completed handling above), so this reader is deliberately
+    tolerant of the field-name variants seen in the wild rather than pinned to
+    one shape:
+
+      * ``type`` in {mcp_tool_call, mcpToolCall} marks the MCP-tool item; the
+        server + tool names live under ``server``/``serverName`` and
+        ``tool``/``toolName``/``name``.
+      * Some patch builds nest these under ``item`` again — handled by the
+        caller passing the inner item.
+
+    Returns None for any non-MCP item (codex's own ``function_call`` builtin
+    tools, agent messages, reasoning, etc.) so only true MCP tools land in
+    ``loaded_mcp_tools`` — matching the ``mcp__`` prefix the claude-code
+    producer records and the gate consumes.
+    """
+    if not isinstance(item, dict):
+        return None
+    itype = item.get("type") or ""
+    if itype not in ("mcp_tool_call", "mcpToolCall"):
+        return None
+    server = item.get("server") or item.get("serverName") or ""
+    tool = item.get("tool") or item.get("toolName") or item.get("name") or ""
+    if not server or not tool:
+        return None
+    return f"mcp__{server}__{tool}"
+
+
+def _codex_config_path() -> Path:
+    """Return the codex config file the running CLI reads from.
+
+    Honors ``$CODEX_HOME`` so tests and multi-home deployments can
+    isolate the file without touching the real ``~/.codex``.
+
+    ``CODEX_HOME`` is the ``.codex`` directory itself (matching start.sh
+    and adapter.py, which set/write ``$CODEX_HOME/config.toml`` and
+    ``$CODEX_HOME/auth.json``), not its parent. When unset, fall back to
+    ``~/.codex``.
+    """
+    if "CODEX_HOME" in os.environ:
+        return Path(os.environ["CODEX_HOME"]) / "config.toml"
+    return Path(os.path.expanduser("~")) / ".codex" / "config.toml"
+
+
+def _read_codex_mcp_servers(config_path: Path | None = None) -> dict[str, dict]:
+    """Return ``{server_name: spec}`` from ``[mcp_servers]`` in config.toml.
+
+    Returns an empty dict when the file is missing, unreadable, or
+    contains no MCP server tables. This is the "no-loaded" case that
+    keeps the gate degraded rather than guessing a static tool list.
+    """
+    path = config_path or _codex_config_path()
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return {}
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return {}
+    return {
+        name: spec
+        for name, spec in servers.items()
+        if isinstance(spec, dict)
+    }
+
+
+async def _send_mcp_message(
+    proc: asyncio.subprocess.Process, msg: dict[str, Any]
+) -> None:
+    """Write one newline-delimited JSON-RPC message to the MCP server."""
+    assert proc.stdin is not None
+    line = json.dumps(msg, separators=(",", ":")) + "\n"
+    proc.stdin.write(line.encode("utf-8"))
+    await proc.stdin.drain()
+
+
+async def _recv_mcp_response(
+    proc: asyncio.subprocess.Process, *, expected_id: int, timeout: float
+) -> dict[str, Any] | None:
+    """Read JSON-RPC responses until ``expected_id`` arrives.
+
+    Drops unsolicited notifications/requests. Returns ``None`` on EOF or
+    timeout so callers degrade gracefully.
+    """
+    assert proc.stdout is not None
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return None
+        try:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return None
+        if not raw:
+            return None
+        try:
+            msg = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(msg, dict) and msg.get("id") == expected_id:
+            return msg
+
+
+async def _list_tools_from_mcp_server(
+    command: str,
+    args: list[str],
+    env: dict[str, str],
+) -> list[str]:
+    """Return raw tool names advertised by one MCP server.
+
+    Performs a minimal stdio JSON-RPC handshake (initialize +
+    notifications/initialized + tools/list). Any failure — missing
+    binary, handshake timeout, unexpected response — returns an empty
+    list so a flaky or misconfigured server is treated as "not loaded"
+    rather than crashing the turn.
+    """
+    cmd = [command, *(args or [])]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+    except Exception as exc:
+        logger.debug("MCP server spawn failed for %r: %s", command, exc)
+        return []
+
+    try:
+        await _send_mcp_message(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": _MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "molecule-runtime-codex",
+                        "version": "0.1.0",
+                    },
+                },
+            },
+        )
+        init_resp = await _recv_mcp_response(
+            proc, expected_id=1, timeout=_MCP_HANDSHAKE_TIMEOUT
+        )
+        if not isinstance(init_resp, dict) or "result" not in init_resp:
+            return []
+
+        await _send_mcp_message(
+            proc,
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        await _send_mcp_message(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {},
+            },
+        )
+        tools_resp = await _recv_mcp_response(
+            proc, expected_id=2, timeout=_MCP_HANDSHAKE_TIMEOUT
+        )
+        if not isinstance(tools_resp, dict) or "result" not in tools_resp:
+            return []
+        tools = tools_resp["result"].get("tools")
+        if not isinstance(tools, list):
+            return []
+        return [
+            str(t["name"])
+            for t in tools
+            if isinstance(t, dict) and isinstance(t.get("name"), str)
+        ]
+    except Exception as exc:
+        logger.debug("MCP tool enumeration failed for %r: %s", command, exc)
+        return []
+    finally:
+        try:
+            if proc.returncode is None:
+                proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except Exception:
+            pass
+
+
+async def extract_loaded_mcp_tools(
+    config_path: Path | None = None,
+) -> list[str]:
+    """Return the loaded MCP inventory as ``mcp__<server>__<tool>`` ids.
+
+    Mirrors the google-adk #3082 inventory fix: instead of only the
+    tools invoked during the current turn, enumerate the actually-loaded
+    tool declarations from each MCP server configured in codex's native
+    ``~/.codex/config.toml``. Empty/no-loaded stays degraded (empty list).
+    """
+    servers = _read_codex_mcp_servers(config_path)
+    if not servers:
+        return []
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for name, spec in servers.items():
+        command = spec.get("command")
+        if not isinstance(command, str) or not command:
+            continue
+        args = spec.get("args")
+        if not isinstance(args, list):
+            args = []
+        # Server env overrides the parent process env (matches how codex
+        # spawns its MCP children).
+        spec_env = spec.get("env")
+        server_env = {
+            **os.environ,
+            **(spec_env if isinstance(spec_env, dict) else {}),
+        }
+        raw_tools = await _list_tools_from_mcp_server(command, args, server_env)
+        for tool in raw_tools:
+            tid = f"mcp__{name}__{tool}"
+            if tid not in seen:
+                seen.add(tid)
+                result.append(tid)
+    return sorted(result)
 
 
 class CodexAppServerExecutor(AgentExecutor):
@@ -125,6 +383,11 @@ class CodexAppServerExecutor(AgentExecutor):
         # currently-running turn (best-effort).
         self._current_turn_id: str | None = None
         self._pending_attached_files: list[dict[str, str]] = []
+        # Cache for the enumerated MCP inventory. ``None`` means "not yet
+        # successfully enumerated"; an empty set means "enumerated and
+        # no MCP tools are loaded". Once non-empty, the inventory is
+        # stable for the lifetime of the executor.
+        self._loaded_mcp_tools: set[str] | None = None
 
     # ------------------------------------------------------------------
     # Bootstrap
@@ -202,6 +465,22 @@ class CodexAppServerExecutor(AgentExecutor):
             logger.info("codex thread started: %s", self._thread_id)
 
         return self._thread_id
+
+    async def _ensure_loaded_mcp_tools(self) -> set[str]:
+        """Return the loaded MCP inventory, enumerating it once per session.
+
+        The inventory is read from codex's native ``~/.codex/config.toml``
+        by spawning each configured MCP server and calling ``tools/list``.
+        A non-empty result is cached; an empty result is NOT cached so a
+        slow-to-start or transiently-failing server is retried next turn
+        rather than permanently cached as degraded.
+        """
+        if self._loaded_mcp_tools is not None:
+            return self._loaded_mcp_tools
+        tools = await extract_loaded_mcp_tools()
+        if tools:
+            self._loaded_mcp_tools = set(tools)
+        return self._loaded_mcp_tools or set()
 
     # ------------------------------------------------------------------
     # AgentExecutor contract
@@ -401,7 +680,13 @@ class CodexAppServerExecutor(AgentExecutor):
         thread_id = await self._ensure_thread()
         assert self._app_server is not None  # set by _ensure_thread
 
+        # codex#3082 / #142: report the actual loaded MCP inventory, not just
+        # the tools invoked this turn. Enumerate each configured MCP server
+        # from ~/.codex/config.toml and merge with any tools observed live.
+        loaded_tools = await self._ensure_loaded_mcp_tools()
+
         state = _TurnState()
+        state.mcp_tools.update(loaded_tools)
         loop = asyncio.get_running_loop()
 
         def on_notification(method: str, params: dict[str, Any]) -> None:
@@ -480,6 +765,12 @@ class CodexAppServerExecutor(AgentExecutor):
                     whole = item.get("message") or item.get("text") or ""
                     if whole and whole not in state.deltas:
                         state.deltas.append(whole)
+                # codex#3082: record MCP tool calls so the heartbeat can report
+                # loaded_mcp_tools (proves the management MCP's tools are LIVE,
+                # not merely declared in config.toml). No-op for non-MCP items.
+                tid = _mcp_tool_id_from_item(item)
+                if tid:
+                    state.mcp_tools.add(tid)
                 return
             if method == "turn/completed":
                 # 0.130's equivalent of `task_complete`. Codex emits
@@ -557,6 +848,17 @@ class CodexAppServerExecutor(AgentExecutor):
         finally:
             unsubscribe()
             self._current_turn_id = None
+            # codex#142 / #3082: publish the loaded MCP inventory (enumerated
+            # from ~/.codex/config.toml) plus any tools invoked live this turn.
+            # A healthy concierge with the management MCP loaded reports
+            # create_workspace even on turns where the model did not call it,
+            # so the platform online/degraded gate doesn't fail-close. An
+            # empty list is still a meaningful "a turn completed" signal.
+            # Bookkeeping only; never let it raise into the turn result.
+            try:
+                set_loaded_mcp_tools(sorted(state.mcp_tools))
+            except Exception:  # noqa: BLE001
+                logger.debug("loaded_mcp_tools capture skipped", exc_info=True)
 
         if state.error:
             raise state.error
