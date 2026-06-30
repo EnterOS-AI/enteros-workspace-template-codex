@@ -177,21 +177,34 @@ class CodexAdapter(BaseAdapter):
             workspace_config_path=getattr(config, "config_path", "") or "",
         )
 
-        # Provider selection is flag-free. ``LLM_PROVIDER`` is the canonical
-        # signal core injects for platform-routed workspaces (the same env the
-        # runtime resolver and the claude-code adapter consume); ``MODEL_PROVIDER``
-        # is the legacy alias. A value that names a provider the registry
-        # accepts — INCLUDING ``platform`` — is taken as the explicit provider,
-        # so the platform arm is selected exactly like any other arm
-        # (provider==platform) rather than via a billing-mode env.
+        # Provider selection is flag-free. ``MOLECULE_RESOLVED_PROVIDER`` is the
+        # SSOT signal: core's workspace provisioner resolves the provider ONCE
+        # (Go ``manifest.DeriveProvider``) and publishes the resolved registry
+        # arm name in this single env var for every downstream layer to READ,
+        # never re-derive. It is the TOP-PRECEDENCE explicit provider — when
+        # present it wins over ``LLM_PROVIDER``/``MODEL_PROVIDER`` and the
+        # model-derived subscription auto-detection, so codex selects exactly the
+        # arm core resolved (``platform`` for the metered proxy, a byok arm
+        # otherwise). ``LLM_PROVIDER`` (the legacy platform-routed signal core
+        # injected) and ``MODEL_PROVIDER`` (the legacy alias) remain as
+        # back-compat fallbacks for old provisioners that predate the SSOT
+        # signal — consumed only when ``MOLECULE_RESOLVED_PROVIDER`` is absent.
+        #
+        # A value that names a provider the registry accepts — INCLUDING
+        # ``platform`` — is taken as the explicit provider, so the platform arm
+        # is selected exactly like any other arm (provider==platform) rather
+        # than via a billing-mode env.
         #
         # MODEL_PROVIDER is historically overloaded in the platform stack: old
         # provisioners used it for a model id, while newer config paths use it
         # for a provider name. Treat it as explicit only when it names a
         # provider the registry actually accepts. A leaked value like "gpt-5.5"
-        # must not override the subscription auto-detection path.
+        # must not override the subscription auto-detection path. (The SSOT
+        # ``MOLECULE_RESOLVED_PROVIDER`` always carries a registry arm name, so
+        # the same registry-name validation applies to it uniformly.)
         env_provider = (
-            os.environ.get("LLM_PROVIDER")
+            os.environ.get("MOLECULE_RESOLVED_PROVIDER")
+            or os.environ.get("LLM_PROVIDER")
             or os.environ.get("MODEL_PROVIDER")
             or ""
         ).strip()
