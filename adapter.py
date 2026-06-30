@@ -177,13 +177,24 @@ class CodexAdapter(BaseAdapter):
             workspace_config_path=getattr(config, "config_path", "") or "",
         )
 
-        # MODEL_PROVIDER is historically overloaded in the platform
-        # stack: old provisioners used it for a model id, while newer
-        # config paths use it for a provider name. Treat it as explicit
-        # only when it names a provider the registry actually accepts.
-        # A leaked value like "gpt-5.5" must not override the
-        # subscription auto-detection path.
-        env_provider = (os.environ.get("MODEL_PROVIDER") or "").strip()
+        # Provider selection is flag-free. ``LLM_PROVIDER`` is the canonical
+        # signal core injects for platform-routed workspaces (the same env the
+        # runtime resolver and the claude-code adapter consume); ``MODEL_PROVIDER``
+        # is the legacy alias. A value that names a provider the registry
+        # accepts — INCLUDING ``platform`` — is taken as the explicit provider,
+        # so the platform arm is selected exactly like any other arm
+        # (provider==platform) rather than via a billing-mode env.
+        #
+        # MODEL_PROVIDER is historically overloaded in the platform stack: old
+        # provisioners used it for a model id, while newer config paths use it
+        # for a provider name. Treat it as explicit only when it names a
+        # provider the registry actually accepts. A leaked value like "gpt-5.5"
+        # must not override the subscription auto-detection path.
+        env_provider = (
+            os.environ.get("LLM_PROVIDER")
+            or os.environ.get("MODEL_PROVIDER")
+            or ""
+        ).strip()
         provider_names = {p["name"].lower() for p in providers}
         if env_provider and env_provider.lower() in provider_names:
             explicit_provider = env_provider
@@ -197,20 +208,15 @@ class CodexAdapter(BaseAdapter):
         else:
             explicit_provider = yaml_provider or None
 
-        # Platform-managed LLM: force the `platform` provider (proxy Responses
-        # surface) regardless of MODEL_PROVIDER/yaml. In this mode the tenant
-        # has no BYOK key (the workspace-server strips them); the proxy owns
-        # the keys + usage billing. The base_url is overridden below with the
-        # injected MOLECULE_LLM_BASE_URL (per-env), and codex POSTs
-        # {base_url}/responses (wire_api=responses).
-        platform_managed = os.environ.get("MOLECULE_LLM_BILLING_MODE") == "platform_managed"
-        if platform_managed:
-            if "platform" not in provider_names:
-                raise RuntimeError(
-                    "codex adapter: MOLECULE_LLM_BILLING_MODE=platform_managed but no "
-                    "`platform` provider in the registry — add it to config.yaml `providers:`"
-                )
-            explicit_provider = "platform"
+        # The `platform` provider (proxy Responses surface) is selected the
+        # same way every other arm is — by the resolved provider above, i.e.
+        # explicit_provider=="platform" coming from LLM_PROVIDER/MODEL_PROVIDER
+        # (core injects LLM_PROVIDER=platform for platform-routed workspaces) or
+        # the YAML provider. When it IS the picked arm, the tenant has no BYOK
+        # key (the workspace-server strips them); the proxy owns the keys +
+        # usage billing, and the base_url is overridden below with the injected
+        # MOLECULE_LLM_BASE_URL (per-env). codex POSTs {base_url}/responses
+        # (wire_api=responses). There is NO billing-mode env gating this.
 
         # Defense-in-depth for the CP workspace-config writer bug
         # (2026-05-18 Reviewer + Researcher wedge): if the upstream
@@ -235,9 +241,11 @@ class CodexAdapter(BaseAdapter):
             # base_url + env key (the analog #180 in claude-code).
             raise
 
-        # Platform-managed: prefer the injected per-env proxy base over the
+        # Platform arm: prefer the injected per-env proxy base over the
         # registry's static (prod) base_url, so staging routes to staging.
-        if platform_managed:
+        # Keyed on the RESOLVED provider (provider=="platform"), never on a
+        # billing-mode env.
+        if picked["name"] == "platform":
             base = (os.environ.get("MOLECULE_LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "").strip()
             if base:
                 picked = {**picked, "base_url": base.rstrip("/")}
