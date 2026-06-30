@@ -40,7 +40,23 @@ on:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  # CANONICAL content-addressed registry host (Cloudflare-fronted alias) -
+  # used for the promoted PIN ref and the image labels (IMAGE_NAME@<digest>).
   IMAGE_NAME: registry.moleculesai.app/molecule-ai/workspace-template-codex
+  # CF-BYPASS local push endpoint. registry.moleculesai.app is Cloudflare-
+  # fronted with a ~100MB request-body cap, but buildx/docker uploads the
+  # 1.7-2.4GB template layers as a monolithic blob PUT -> Cloudflare 413
+  # Payload Too Large. Push straight to the local Gitea OCI endpoint instead:
+  # the runner mounts the host docker.sock, so docker login/push execute
+  # against the HOST docker daemon, where `localhost:3200` is the host's
+  # Gitea port-map (an insecure-OK localhost registry - no TLS / insecure-
+  # registries config required). It is the SAME Gitea backend that serves
+  # registry.moleculesai.app, so the pushed manifest is content-addressed
+  # and host-independent and the canonical-host pin resolves + pulls
+  # identically. Mirrors the Track-A Phase-1 host-side seed (blobs pushed
+  # direct to the local Gitea, not via the Cloudflare alias).
+  PUSH_HOST: localhost:3200
+  PUSH_IMAGE_NAME: localhost:3200/molecule-ai/workspace-template-codex
 
 permissions:
   contents: read
@@ -147,7 +163,7 @@ jobs:
           fi
           echo "::notice::no bare imports of runtime modules in *.py files"
 
-      - name: Log in to our container registry (Gitea OCI)
+      - name: Log in to our container registry (Gitea OCI - CF-bypass local push endpoint)
         # ECR retired (operator directive: use our own registry). Push to the
         # Gitea-backed OCI registry at registry.moleculesai.app. The push
         # credential is the Gitea package-publisher, fetched from the Infisical
@@ -180,9 +196,9 @@ jobs:
             echo "::error::Infisical returned empty registry publisher creds at /ci/gitea-pypi-publisher"
             exit 1
           fi
-          echo "$GITEA_TOKEN" | docker login registry.moleculesai.app -u "$GITEA_USER" --password-stdin \
-            || { echo "::error::docker login to registry.moleculesai.app failed"; exit 1; }
-          echo "::notice::logged in to registry.moleculesai.app as $GITEA_USER"
+          echo "$GITEA_TOKEN" | docker login "$PUSH_HOST" -u "$GITEA_USER" --password-stdin \
+            || { echo "::error::docker login to $PUSH_HOST failed"; exit 1; }
+          echo "::notice::logged in to $PUSH_HOST (CF-bypass local Gitea OCI) as $GITEA_USER"
       - name: Verify Docker daemon access
         run: |
           set -euo pipefail
@@ -203,7 +219,7 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          tags: ${{ env.PUSH_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
           build-args: |
             RUNTIME_VERSION=${{ needs.resolve-version.outputs.version }}
           labels: |
@@ -214,7 +230,7 @@ jobs:
       - name: Smoke test — import every /app/*.py
         shell: bash
         env:
-          IMAGE: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          IMAGE: ${{ env.PUSH_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
         run: |
           set -eu
           docker run --rm \
@@ -233,23 +249,33 @@ jobs:
           '
           echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
 
-      - name: Push image to registry (post-smoke)
+      - name: Push image to registry (CF-bypass local endpoint, post-smoke)
         id: push
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
-          build-args: |
-            RUNTIME_VERSION=${{ needs.resolve-version.outputs.version }}
-          labels: |
-            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.description=Molecule AI workspace template — codex runtime
+        # Smoke passed. Push the locally-loaded image straight to the local Gitea
+        # OCI endpoint via the HOST docker daemon with a plain `docker push` (NOT
+        # buildx): the blob upload travels host->localhost:3200 and never crosses
+        # Cloudflare, so the 1.7-2.4GB layers no longer hit the ~100MB CF request-
+        # body cap (413 Payload Too Large). The manifest digest is content-
+        # addressed and host-independent, so promote-pin still pins the CANONICAL
+        # host ref (IMAGE_NAME@<digest>), which resolves + pulls via Cloudflare
+        # all the same. Image labels are already baked by the build-load step, so
+        # no rebuild happens here. `steps.push.outputs.digest` is preserved for
+        # the downstream promote-pin job.
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA_REF="${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}"
+          docker tag "${SHA_REF}" "${PUSH_IMAGE_NAME}:latest"
+          docker push "${PUSH_IMAGE_NAME}:latest"
+          PUSHOUT="$(docker push "${SHA_REF}")"
+          printf '%s\n' "${PUSHOUT}"
+          DIGEST="$(printf '%s\n' "${PUSHOUT}" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | head -1)"
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::could not parse the pushed manifest digest from docker push output"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "::notice::pushed ${SHA_REF} + :latest to ${PUSH_HOST}; manifest digest ${DIGEST} (pins as ${IMAGE_NAME}@${DIGEST})"
 
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to
