@@ -97,31 +97,18 @@ jobs:
 
   publish:
     name: Build & push workspace-template-codex image
-    # Pin to the dedicated Linux publish runners (label "publish" →
-    # molecule-runner-publish-1/2). MUST NOT use `ubuntu-latest`: that
-    # label is also advertised by the Windows/WSL self-hosted runners
-    # (hongming-pc-runner-*, "C:\Users\qz154\.cache\act"), so the
-    # docker-build/push job landed non-deterministically on a Windows
-    # runner where `aws ecr get-login-password | docker login
-    # --password-stdin` fails with "protocol not available" (Docker
-    # credential store/helper unusable in that act/WSL context). This is
-    # placement-dependent, NOT a transient flake — runs 79610 (commit
-    # 2d54d260, task 127304, hongming-pc-runner-2) and 78342 (283f371,
-    # hongming-pc-runner-3) both failed there; Linux-runner builds
-    # (78300/78302) succeeded. Mirrors the org convention used by every
-    # molecule-core docker build/push job (publish-workspace-server-image
-    # .yml / publish-runtime.yml / publish-canvas-image.yml: `runs-on:
-    # publish`).
-    # AND-of-labels: `publish` is also advertised by some
-    # hongming-pc-runner-publish-* runners (Windows), whose runner-base
-    # image (`docker-config-fix`) breaks `docker login --password-stdin`
-    # with `Error saving credentials: mkdir /home/hongming: permission
-    # denied` (task #280 close-out, 2026-05-19 publish-image run 79 job 1).
-    # op-host molecule-runner-publish-{1,2} are the only runners advertising
-    # BOTH `publish` AND `release` (op-host /opt/molecule/runners/
-    # config.publish.yaml lines 28-29). Requiring both labels routes
-    # publish to op-host deterministically.
-    runs-on: [publish, release]
+    # CF-bypass (Cloudflare 413): this job PUSHES the 1.7-2.4GB image to the
+    # Gitea OCI registry. registry.moleculesai.app is Cloudflare-fronted with a
+    # ~100MB request-body cap, so a monolithic blob PUT of the layers 413s. The
+    # push therefore has to run on a runner CO-LOCATED with the local Gitea,
+    # where `localhost:3200` is the host's registry port and docker login/push
+    # execute against the HOST docker daemon (this runner mounts the host
+    # /var/run/docker.sock; act_runner docker_host = that sock). The local
+    # `ci-meta` runner satisfies this. The dedicated remote `[publish, release]`
+    # runners CANNOT reach the host's localhost:3200 (verified: `docker login
+    # localhost:3200` -> dial tcp 127.0.0.1:3200: connection refused), so they
+    # must not run this job while the registry is served locally + CF-fronted.
+    runs-on: ci-meta
     timeout-minutes: 30
     needs: resolve-version
     # Bubble the Push step's digest to the job level so the downstream
