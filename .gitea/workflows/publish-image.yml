@@ -1,6 +1,6 @@
 name: publish-image
 
-# Builds the codex workspace template Dockerfile and pushes it to ECR as
+# Builds the codex workspace template Dockerfile and pushes it to the Gitea registry (registry.moleculesai.app) as
 # `<REGISTRY>/molecule-ai/workspace-template-codex:latest` + `:sha-<7>`.
 #
 # Ported verbatim in shape from the live-verified claude-code template
@@ -40,9 +40,7 @@ on:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  ECR_REGISTRY: 153263036946.dkr.ecr.us-east-2.amazonaws.com
-  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/workspace-template-codex
-  AWS_DEFAULT_REGION: us-east-2
+  IMAGE_NAME: registry.moleculesai.app/molecule-ai/workspace-template-codex
 
 permissions:
   contents: read
@@ -149,15 +147,42 @@ jobs:
           fi
           echo "::notice::no bare imports of runtime modules in *.py files"
 
-      - name: Log in to ECR
+      - name: Log in to our container registry (Gitea OCI)
+        # ECR retired (operator directive: use our own registry). Push to the
+        # Gitea-backed OCI registry at registry.moleculesai.app. The push
+        # credential is the Gitea package-publisher, fetched from the Infisical
+        # SSOT via the CI bootstrap trio (INFISICAL_CI_*) — never hardcoded.
+        # FORK SAFETY: this workflow has no pull_request trigger (push:[main] +
+        # workflow_dispatch only) so the trio is never exposed to a fork; the
+        # conditional is belt-and-suspenders (Gitea also withholds secrets from
+        # fork runners).
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: |
-          set -euo pipefail
-          aws ecr get-login-password --region us-east-2 | \
-            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          GITEA_USER=$(read_secret GITEA_PYPI_PUBLISHER_USER %2Fci%2Fgitea-pypi-publisher)
+          GITEA_TOKEN=$(read_secret GITEA_PYPI_PUBLISHER_TOKEN %2Fci%2Fgitea-pypi-publisher)
+          echo "::add-mask::$GITEA_TOKEN"
+          if [ -z "$GITEA_USER" ] || [ -z "$GITEA_TOKEN" ]; then
+            echo "::error::Infisical returned empty registry publisher creds at /ci/gitea-pypi-publisher"
+            exit 1
+          fi
+          echo "$GITEA_TOKEN" | docker login registry.moleculesai.app -u "$GITEA_USER" --password-stdin \
+            || { echo "::error::docker login to registry.moleculesai.app failed"; exit 1; }
+          echo "::notice::logged in to registry.moleculesai.app as $GITEA_USER"
       - name: Verify Docker daemon access
         run: |
           set -euo pipefail
@@ -169,24 +194,6 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-
-      - name: Ensure ECR repository exists
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          repo_path="${IMAGE_NAME#*/}"
-          repo_path="${repo_path#*/}"  # → molecule-ai/workspace-template-codex
-          if ! aws ecr describe-repositories --repository-names "${repo_path}" --region us-east-2 >/dev/null 2>&1; then
-            aws ecr create-repository \
-              --repository-name "${repo_path}" \
-              --image-scanning-configuration scanOnPush=true \
-              --region us-east-2 >/dev/null
-            echo "::notice::created ECR repository ${repo_path}"
-          else
-            echo "ECR repository ${repo_path} already exists"
-          fi
 
       - name: Build image (load for smoke test, do not push yet)
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -226,7 +233,7 @@ jobs:
           '
           echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
 
-      - name: Push image to ECR (post-smoke)
+      - name: Push image to registry (post-smoke)
         id: push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
@@ -243,37 +250,6 @@ jobs:
             org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — codex runtime
-
-      # Keep the prod ECR storage bill bounded: declare the canonical image
-      # lifecycle policy on the repo we just pushed. Idempotent + fail-soft
-      # (never fails the publish). SSOT JSON lives in the script.
-      - name: Ensure ECR lifecycle policy
-        env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-2
-        run: |
-          set -uo pipefail
-          # Strip the registry host; pass the bare molecule-ai/<repo> name.
-          REPO_NAME="${IMAGE_NAME#*/}"
-          bash scripts/ensure-ecr-lifecycle.sh "${REPO_NAME}"
-
-      # NOTE: the old "Surface pushed digest as commit status (operator
-      # promotes)" step was DELETED here (keystone pipeline fix). It POSTed a
-      # `runtime-image/pushed-digest` commit status with the auto-injected
-      # `secrets.GITEA_TOKEN` and was `continue-on-error: true`. On Gitea
-      # 1.22.x that POST 403s ("user should be the owner of the repo" — the
-      # Actions token is not a repo owner/collaborator with status-write), and
-      # because the step swallowed the 403 the build went GREEN while NO pin
-      # was ever promoted. There was also NO downstream watcher anywhere that
-      # consumed `runtime-image/pushed-digest`, so even a 201 would have been a
-      # no-op. Result: every codex publish since this repo's pipeline was
-      # restored left runtime_image_pins[codex] STALE, so reprovisions kept
-      # pulling the old #77 sandbox image and the #82 bwrap fix never shipped.
-      # The promote is now a real CP-admin POST (promote-pin job below, the
-      # proven claude-code / hermes RFC internal#529 Layer A pattern), and a
-      # fail-loud verify-pin gate asserts the pin actually moved.
 
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to
