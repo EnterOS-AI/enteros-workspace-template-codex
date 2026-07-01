@@ -805,3 +805,130 @@ def test_config_yaml_executor_timeout_narrative_matches_constant(tmp_path):
         "'currently 600s' copy; update to the live _TURN_TIMEOUT value "
         f"({expected_seconds}s)."
     )
+
+
+# ── RC #203 (tier-C liveness): tool-activity file ping ────────────────────────
+# The base runtime EXPORTS MOLECULE_TOOL_ACTIVITY_FILE and refreshes the turn
+# lease whenever its mtime advances. The executor must bump it on each tool call
+# so a long tool-running turn isn't mistaken for a stall (tier-D fallback). The
+# hook is a strict no-op when the env var is unset (off-kernel / older base).
+
+from executor import _is_tool_activity, _record_tool_activity  # noqa: E402
+
+
+def test_is_tool_activity_matches_tool_markers_only() -> None:
+    # MCP + built-in tool markers across codex schema variants.
+    assert _is_tool_activity("mcp_tool_call")
+    assert _is_tool_activity("mcpToolCall")
+    assert _is_tool_activity("exec_command_begin")
+    assert _is_tool_activity("command_execution")
+    assert _is_tool_activity("patch_apply_begin")
+    assert _is_tool_activity("web_search")
+    # Message / reasoning / lifecycle items must NOT match.
+    assert not _is_tool_activity("agent_message")
+    assert not _is_tool_activity("assistant_message")
+    assert not _is_tool_activity("task_complete")
+    assert not _is_tool_activity("reasoning")
+    assert not _is_tool_activity("")
+
+
+def test_record_tool_activity_noop_when_unset(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("MOLECULE_TOOL_ACTIVITY_FILE", raising=False)
+    _record_tool_activity()  # must not raise, must not create a file
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_record_tool_activity_touches_file_when_set(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "activity"
+    monkeypatch.setenv("MOLECULE_TOOL_ACTIVITY_FILE", str(path))
+    _record_tool_activity()
+    assert path.exists()
+
+
+@pytest.mark.asyncio
+async def test_completed_tool_item_bumps_activity_file(tmp_path, monkeypatch) -> None:
+    """codex 0.130: a completed MCP tool item bumps the exported activity file."""
+    activity = tmp_path / "activity"
+    monkeypatch.setenv("MOLECULE_TOOL_ACTIVITY_FILE", str(activity))
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push(
+            "item/completed",
+            {"item": {"type": "mcp_tool_call", "server": "molecule", "tool": "delegate_task"}},
+        )
+        fake.push_task_complete("done")
+
+    driver_task = asyncio.create_task(driver())
+    await ex._run_turn("do a delegation")
+    await driver_task
+
+    assert activity.exists(), "a completed tool item must bump the tier-C activity file"
+
+
+@pytest.mark.asyncio
+async def test_started_tool_item_bumps_activity_file(tmp_path, monkeypatch) -> None:
+    """codex 0.130: a tool item STARTING is the earliest liveness signal."""
+    activity = tmp_path / "activity"
+    monkeypatch.setenv("MOLECULE_TOOL_ACTIVITY_FILE", str(activity))
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push("item/started", {"item": {"type": "command_execution", "command": "sleep 1"}})
+        fake.push_task_complete("done")
+
+    driver_task = asyncio.create_task(driver())
+    await ex._run_turn("run a long command")
+    await driver_task
+
+    assert activity.exists(), "a started tool item must bump the tier-C activity file"
+
+
+@pytest.mark.asyncio
+async def test_legacy_072_tool_event_bumps_activity_file(tmp_path, monkeypatch) -> None:
+    """codex 0.72: tool work surfaces as *_begin events under codex/event/."""
+    activity = tmp_path / "activity"
+    monkeypatch.setenv("MOLECULE_TOOL_ACTIVITY_FILE", str(activity))
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push(
+            "codex/event/exec_command_begin",
+            {"msg": {"type": "exec_command_begin", "command": "pytest -q"}},
+        )
+        fake.push_task_complete("done")
+
+    driver_task = asyncio.create_task(driver())
+    await ex._run_turn("run the tests")
+    await driver_task
+
+    assert activity.exists(), "a 0.72 exec_command_begin must bump the activity file"
+
+
+@pytest.mark.asyncio
+async def test_tool_item_no_activity_file_off_kernel(tmp_path, monkeypatch) -> None:
+    """Off-kernel (env unset): a tool item writes NO activity file — additive
+    and byte-identical to the pre-kernel behavior."""
+    monkeypatch.delenv("MOLECULE_TOOL_ACTIVITY_FILE", raising=False)
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push(
+            "item/completed",
+            {"item": {"type": "mcp_tool_call", "server": "molecule", "tool": "delegate_task"}},
+        )
+        fake.push_task_complete("done")
+
+    driver_task = asyncio.create_task(driver())
+    await ex._run_turn("do a delegation")
+    await driver_task
+
+    assert list(tmp_path.iterdir()) == [], "off-kernel must not create an activity file"

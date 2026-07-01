@@ -132,6 +132,57 @@ class _TurnState:
     mcp_tools: set = field(default_factory=set)
 
 
+# Substring markers that identify a codex TOOL event/item (MCP or built-in),
+# matched case-insensitively so schema churn across codex patch releases
+# (mcp_tool_call / mcpToolCall / exec_command / command_execution /
+# patch_apply / apply_patch / file_change / web_search / function_call) does not
+# silence the tier-C liveness ping. Deliberately loose: over-touching only keeps
+# a live turn's lease fresh; it can never cause a false stall.
+_TOOL_ACTIVITY_MARKERS = (
+    "tool_call", "toolcall", "exec_command", "command_execution",
+    "commandexecution", "patch_apply", "patchapply", "apply_patch",
+    "file_change", "filechange", "web_search", "websearch", "function_call",
+)
+
+
+def _is_tool_activity(type_or_method: str) -> bool:
+    """True when a codex item type / event method denotes a tool invocation."""
+    t = (type_or_method or "").lower()
+    return any(m in t for m in _TOOL_ACTIVITY_MARKERS)
+
+
+def _record_tool_activity() -> None:
+    """Tier-C turn-lease liveness ping on each tool call (RC #203, template side).
+
+    The base runtime EXPORTS ``MOLECULE_TOOL_ACTIVITY_FILE`` (a private, 0600,
+    per-turn file) when the mailbox kernel is on, and its turn-lease watcher
+    refreshes the lease whenever this file's mtime advances. A codex turn that is
+    churning long tool calls (a multi-minute ``exec_command`` build/test) emits
+    no native runtime event the parent can see, so without this ping the lease
+    goes stale and a live turn is mistaken for a stall — the coarse tier-D
+    output-liveness fallback. Touching the file on each tool call mirrors how
+    claude-code's native ``on_tool_start`` feeds the lease.
+
+    No-op when ``MOLECULE_TOOL_ACTIVITY_FILE`` is unset (off-kernel / older base
+    image) — additive and byte-identical off-kernel. Never raises: a liveness
+    ping must not break a tool call.
+    """
+    path = os.environ.get("MOLECULE_TOOL_ACTIVITY_FILE", "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "w") as fh:
+            fh.write("1")
+    except OSError:
+        return
+    try:
+        # Keep the liveness file private even if we won a create-race with the
+        # runtime's ensure_tool_activity_file(). Best-effort (no-op on Windows).
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _mcp_tool_id_from_item(item: dict) -> str | None:
     """Return ``mcp__<server>__<tool>`` for a codex MCP-tool-call item, else None.
 
@@ -750,6 +801,16 @@ class CodexAppServerExecutor(AgentExecutor):
                 if delta:
                     state.deltas.append(delta)
                 return
+            if method in ("item/started", "item/updated"):
+                # RC #203 (tier-C liveness): a tool item STARTING is the earliest
+                # per-tool-call liveness signal — the analogue of claude-code's
+                # native on_tool_start. Touch the exported activity file for tool
+                # items only (ignore message/reasoning items). No-op when
+                # MOLECULE_TOOL_ACTIVITY_FILE is unset (off-kernel).
+                started = params.get("item") or {}
+                if _is_tool_activity(started.get("type", "")):
+                    _record_tool_activity()
+                return
             if method == "item/completed":
                 # Final assembled message — recover the full text when
                 # delta streaming was skipped (non-OpenAI backends) or
@@ -771,6 +832,11 @@ class CodexAppServerExecutor(AgentExecutor):
                 tid = _mcp_tool_id_from_item(item)
                 if tid:
                     state.mcp_tools.add(tid)
+                # RC #203 (tier-C liveness): a completed tool item (MCP or
+                # built-in) is liveness — bump the activity file so a long
+                # tool-running turn isn't mistaken for a stall. No-op off-kernel.
+                if tid or _is_tool_activity(item.get("type", "")):
+                    _record_tool_activity()
                 return
             if method == "turn/completed":
                 # 0.130's equivalent of `task_complete`. Codex emits
@@ -827,6 +893,13 @@ class CodexAppServerExecutor(AgentExecutor):
                     msg.get("message", "")
                 )
             else:
+                # RC #203 (tier-C liveness): the 0.72 legacy schema surfaces tool
+                # work as `*_begin`/`*_end` events (exec_command_begin,
+                # mcp_tool_call_begin, patch_apply_begin, ...) that land here.
+                # Touch the exported activity file on those so a long tool call
+                # keeps the lease fresh. No-op off-kernel (env var unset).
+                if _is_tool_activity(mtype):
+                    _record_tool_activity()
                 logger.debug("codex event: %s %s", mtype, msg)
 
         unsubscribe = self._app_server.subscribe(on_notification)
