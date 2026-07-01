@@ -96,7 +96,7 @@ COPY requirements.txt .
 ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
+      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
     fi && \
     python3 -c "import molecule_runtime.preflight as pf; s=getattr(pf,'SUPPORTED_RUNTIMES',None); s.add('codex') if isinstance(s,set) else None; print('preflight SUPPORTED_RUNTIMES shim:', 'patched' if isinstance(s,set) else 'n/a (adapter-module discovery is authoritative)')" || true
 
