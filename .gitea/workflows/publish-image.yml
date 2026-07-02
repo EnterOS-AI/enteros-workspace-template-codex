@@ -87,7 +87,7 @@ jobs:
           # requirements.txt MUST agree, or a requirements-only bump silently ships the old runtime
           # (root cause of the 2026-05-31 codex chat regression — PR#69 bumped only requirements.txt).
           if [ -f .runtime-version ] && [ -f requirements.txt ]; then
-            req="$(grep -E '^molecule-ai-workspace-runtime==' requirements.txt | head -n1 | sed -E 's/.*==//' | tr -d '[:space:]')"
+            req="$(grep -E '^molecules-workspace-runtime==' requirements.txt | head -n1 | sed -E 's/.*==//' | tr -d '[:space:]')"
             if [ -n "${req}" ] && [ "${req}" != "${v:-}" ]; then
               echo "::error::.runtime-version (${v:-<unset>}) != requirements.txt pin (${req}). Bump BOTH — the image pins from .runtime-version."
               exit 1
