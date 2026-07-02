@@ -273,15 +273,13 @@ jobs:
     # push red) never bumps any pin — promotion only runs AFTER a green
     # build/push.
     #
-    # Dual-environment fan-out: staging CP `runtime_image_pins` is a SEPARATE
-    # SSOT from prod, so the `E2E Staging SaaS` canary boots whatever staging's
-    # pin points at. We promote to BOTH prod (api.moleculesai.app) and staging
-    # (staging-api.moleculesai.app). `strategy.fail-fast: false` makes each
-    # matrix leg independent — a prod-promote failure does NOT cancel/block the
-    # staging-promote and vice-versa — but each leg is still fail-LOUD on a
-    # non-2xx for ITS OWN target so a stranded pin is never hidden behind a
-    # green workflow. Mirrors molecule-ai-workspace-template-claude-code and
-    # -hermes byte-for-byte except TEMPLATE_NAME=codex.
+    # staging CP `runtime_image_pins` is a SEPARATE SSOT from prod, so the
+    # `E2E Staging SaaS` canary boots whatever staging's pin points at. We
+    # promote to staging (staging-api.moleculesai.app); the prod leg is removed
+    # under the prod-freeze (see the matrix comment below). `strategy.fail-fast:
+    # false` keeps each matrix leg independent and fail-LOUD on a non-2xx for ITS
+    # OWN target so a stranded pin is never hidden behind a green workflow.
+    # Mirrors the google-adk sibling (prod-freeze-aware, staging live).
     name: Promote runtime_image_pins (CP admin)
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -293,15 +291,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - env_name: prod
-            cp_host: api.moleculesai.app
+          # prod leg removed (prod-freeze). Prod cutover is pending-operator and
+          # the prod CP admin bearer is not provisioned to match any token these
+          # template repos hold, so POST /cp/admin/runtime-image/promote to
+          # api.moleculesai.app returns HTTP 401 by design (AdminGate bearer
+          # compare). Auto-promoting to prod during the freeze is exactly what
+          # the freeze prohibits, so this leg is de-required rather than papered
+          # over. Restore the prod include once prod cutover completes and a
+          # matching prod CP admin token is provisioned. Staging stays the live
+          # promote target. Mirrors the google-adk sibling.
           - env_name: staging
             cp_host: staging-api.moleculesai.app
     steps:
       - name: POST /cp/admin/runtime-image/promote (${{ matrix.env_name }})
         env:
           PROD_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
-          STAGING_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN_STAGING }}
+          # Staging CP admin token — same secret name the google-adk/claude-code
+          # siblings use (verified live: google-adk staging promote → HTTP 200).
+          # The old CP_ADMIN_API_TOKEN_STAGING name 401s (not the provisioned key).
+          STAGING_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
           ENV_NAME: ${{ matrix.env_name }}
           CP_HOST: ${{ matrix.cp_host }}
           TEMPLATE_NAME: codex
@@ -314,7 +322,7 @@ jobs:
             TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN"
           else
             CP_ADMIN_API_TOKEN="${STAGING_TOKEN}"
-            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN_STAGING"
+            TOKEN_SECRET_NAME="CP_STAGING_ADMIN_API_TOKEN"
           fi
           if [ -z "${CP_ADMIN_API_TOKEN}" ]; then
             echo "::error::${TOKEN_SECRET_NAME} secret not configured on this repo — cannot promote ${ENV_NAME} pin"
@@ -368,12 +376,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - env_name: prod
-            cp_host: api.moleculesai.app
-            token_secret: CP_ADMIN_API_TOKEN
+          # prod leg removed (prod-freeze) — see the promote-pin matrix comment.
+          # There is nothing to verify on prod because nothing is promoted there
+          # during the freeze. Staging stays the live verify target.
           - env_name: staging
             cp_host: staging-api.moleculesai.app
-            token_secret: CP_ADMIN_API_TOKEN_STAGING
+            token_secret: CP_STAGING_ADMIN_API_TOKEN
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Verify runtime_image_pins[ codex, ${{ matrix.env_name }} ]
