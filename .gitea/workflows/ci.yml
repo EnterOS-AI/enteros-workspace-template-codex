@@ -47,7 +47,16 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+  # HERMETIC dep policy (CI-robustness): do NOT set PIP_INDEX_URL=private —
+  # it force-routes EVERY pip install (pytest, pyyaml, jsonschema, …) at the
+  # private index, which serves only molecules-workspace-runtime → 404s all
+  # public tooling (the Adapter-unit-tests / Template-validation reds). Public
+  # tooling resolves from the default (PyPI) index; the private runtime — which
+  # is ABSENT from public PyPI, so no dependency-confusion — is pulled via an
+  # EXPLICIT --extra-index-url on the runtime install only. The legacy name
+  # molecule-ai-workspace-runtime IS squatted on public PyPI (0.1.999999); we
+  # install the CURRENT dist name molecules-workspace-runtime (private-only).
+  MOLECULE_PRIVATE_INDEX: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 # Defense-in-depth on GITHUB_TOKEN scope. validate-runtime +
 # t4-conformance run untrusted-by-design code (pip-install, adapter
@@ -146,9 +155,9 @@ jobs:
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       - run: pip install pyyaml -q
       - if: hashFiles('requirements.txt') != ''
-        run: pip install -q -r requirements.txt
+        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
       - if: hashFiles('requirements.txt') == ''
-        run: pip install -q molecule-ai-workspace-runtime
+        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
@@ -361,5 +370,5 @@ jobs:
       - run: pip install -q pytest pytest-asyncio pyyaml
       # The adapter credential-preflight tests (test_modernization_pr1.py)
       # import molecule_runtime.adapters.base via the _adapter fixture.
-      - run: pip install -q molecule-ai-workspace-runtime
+      - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
       - run: python3 -m pytest tests/ -v

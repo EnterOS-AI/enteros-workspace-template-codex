@@ -94,9 +94,18 @@ COPY requirements.txt .
 # on a mutable SUPPORTED_RUNTIMES set. `|| true` so a runtime that has
 # no such attribute (the modern shape) builds clean.
 ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
-RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt && \
+# Public deps (python-multipart, a2a-sdk, claude-agent-sdk, and the private
+# runtime's public transitive deps) live on PyPI, not the private Gitea PyPI
+# index. Add pypi.org as an --extra-index-url (NOT --index-url) so the PRIVATE
+# Gitea index stays the PRIMARY resolver for the private molecules-workspace-
+# runtime dist. Matches the accepted pattern already shipped in the hermes/
+# openclaw/langgraph templates (RFC internal#596). Without this the docker
+# build dies with "No matching distribution found for python-multipart" — a
+# real build-arg bug, NOT a runner-egress issue (robot-1 reaches pypi.org).
+ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
+      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
     fi && \
     python3 -c "import molecule_runtime.preflight as pf; s=getattr(pf,'SUPPORTED_RUNTIMES',None); s.add('codex') if isinstance(s,set) else None; print('preflight SUPPORTED_RUNTIMES shim:', 'patched' if isinstance(s,set) else 'n/a (adapter-module discovery is authoritative)')" || true
 
