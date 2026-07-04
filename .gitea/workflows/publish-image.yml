@@ -176,8 +176,8 @@ jobs:
               -H "Authorization: Bearer $TOK" \
               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
           }
-          GITEA_USER=$(read_secret GITEA_PYPI_PUBLISHER_USER %2Fci%2Fgitea-pypi-publisher)
-          GITEA_TOKEN=$(read_secret GITEA_PYPI_PUBLISHER_TOKEN %2Fci%2Fgitea-pypi-publisher)
+          GITEA_USER="pypi-publisher"  # canonical least-priv publisher (write:package)
+          GITEA_TOKEN=$(read_secret MOL_PACKAGE_TOKEN %2Fci%2Fgitea-pypi-publisher)
           echo "::add-mask::$GITEA_TOKEN"
           if [ -z "$GITEA_USER" ] || [ -z "$GITEA_TOKEN" ]; then
             echo "::error::Infisical returned empty registry publisher creds at /ci/gitea-pypi-publisher"
