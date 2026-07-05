@@ -104,7 +104,7 @@ RUN set -eux; \
 # (molecule-ai-plugin-molecule-platform-mcp settings-fragment.json). A stale bake
 # still WORKS (npx --prefer-offline network-fallback) but forfeits determinism, so
 # keep them in lockstep. Declared as an ARG so the publish workflow can override.
-ARG MCP_SERVER_VERSION=1.7.0
+ARG MCP_SERVER_VERSION=1.8.1
 USER agent
 RUN set -eux; \
     mkdir -p /home/agent/.npm; \
