@@ -1,5 +1,5 @@
 # Molecule AI workspace runtime — adapter + A2A server infra
-molecules-workspace-runtime==0.3.75
+molecules-workspace-runtime==0.3.85
 # Pin a2a-sdk: the runtime parses a2a messages; floating into a new major
 # (1.0.x protobuf migration) silently broke message extraction. Pin it.
 a2a-sdk==1.0.3
