@@ -371,4 +371,11 @@ jobs:
       # The adapter credential-preflight tests (test_modernization_pr1.py)
       # import molecule_runtime.adapters.base via the _adapter fixture.
       - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
+      # ADR-004 adapter-socket conformance (tests/test_conformance.py) inherits
+      # the SDK-owned battery molecule_plugin.adapter_conformance.AdapterConformance,
+      # so the SDK must be installed for the conformance test to import. Like the
+      # runtime above it is a private-index dist (molecule-ai-sdk), resolved with
+      # an EXPLICIT --extra-index-url per the hermetic dep policy (no global
+      # PIP_INDEX_URL — see the env: block).
+      - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecule-ai-sdk
       - run: python3 -m pytest tests/ -v

@@ -30,6 +30,163 @@ from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
 
 logger = logging.getLogger(__name__)
 
+# ===========================================================================
+# ADR-004 adapter-socket: the CODEX per-runtime shape, OWNED HERE.
+# ===========================================================================
+# Per ADR-004 (SDK owns the adapter contract; the shared engine holds zero
+# per-runtime dispatch), the codex-specific MCP-render / read / present /
+# persona shape moves OUT of molecule_runtime's _RUNTIME_SPECS / _RUNTIME_READERS
+# / _RUNTIME_PERSONA dispatch tables and INTO this adapter. The functions below
+# are copied FAITHFULLY (byte-identical native-config output) from the engine's
+# mcp_render.py / persona_render.py codex branches so this adapter renders the
+# EXACT same ~/.codex/config.toml + AGENTS.md the engine produces today — the
+# golden-parity invariant the migration must preserve. The engine still holds
+# an identical codex branch (deletion is a later phase); this adapter only ADDS
+# the socket methods so both render identically.
+#
+# Codex reads MCP servers from ~/.codex/config.toml under the [mcp_servers.<name>]
+# table; identity from AGENTS.md (the AAIF convention) in its project directory.
+
+# Codex reads MCP servers from this TOML table (mcp_render.CODEX_MCP_TABLE).
+_CODEX_MCP_TABLE = "mcp_servers"
+
+# Codex reads the AAIF-standard AGENTS.md as its native identity file
+# (persona_render.CODEX_PERSONA_FILE).
+_CODEX_PERSONA_FILE = "AGENTS.md"
+
+
+def _codex_path(config_path) -> Path:
+    """Absolute native MCP-config file codex reads (mcp_render._codex_path).
+
+    Codex reads ~/.codex/config.toml. ``config_path`` is unused (the codex CLI
+    resolves ``$HOME``), but the signature is uniform across the socket.
+    """
+    return Path(os.path.expanduser("~")) / ".codex" / "config.toml"
+
+
+def _codex_persona_path(config_path) -> Path:
+    return Path(config_path) / _CODEX_PERSONA_FILE
+
+
+# --- TOML rendering (verbatim from mcp_render: _toml_escape/_toml_value/
+# _render_codex_table/_codex_markers/render_codex_config) ---
+
+def _toml_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _toml_value(v) -> str:
+    """Render a scalar/list value as a TOML literal. Scoped to the value
+    shapes an MCP spec carries (str, list[str], and nested str->str env dict
+    handled by the caller)."""
+    if isinstance(v, str):
+        return f'"{_toml_escape(v)}"'
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    # Fallback: stringify (defensive — MCP specs shouldn't reach here).
+    return f'"{_toml_escape(str(v))}"'
+
+
+def _render_codex_table(name: str, spec: dict) -> str:
+    """Emit the ``[mcp_servers.<name>]`` TOML block for a single server.
+
+    We keep ``env`` (a str->str map) in its own sub-table, which is the
+    unambiguous TOML form and avoids inline-table escaping edge cases.
+    """
+    lines = [f"[{_CODEX_MCP_TABLE}.{name}]"]
+    env = None
+    for k, v in spec.items():
+        if k == "env" and isinstance(v, dict):
+            env = v
+            continue
+        lines.append(f"{k} = {_toml_value(v)}")
+    if env:
+        lines.append("")
+        lines.append(f"[{_CODEX_MCP_TABLE}.{name}.env]")
+        for ek, ev in env.items():
+            lines.append(f"{ek} = {_toml_value(ev)}")
+    return "\n".join(lines) + "\n"
+
+
+def _codex_markers(name: str) -> tuple[str, str]:
+    begin = f"# >>> molecule-mcp:{name} >>>"
+    end = f"# <<< molecule-mcp:{name} <<<"
+    return begin, end
+
+
+def _render_codex_config(config_path: Path, name: str, spec: dict) -> None:
+    """Additively merge ``name -> spec`` into the codex ``config.toml``
+    ``[mcp_servers.<name>]`` table. Idempotent; preserves the rest of the file.
+
+    Manages each server as a marker-delimited block: on re-install we strip the
+    prior block for THIS server name and re-append the freshly rendered one,
+    leaving every other server (and any hand-written config) intact.
+    """
+    config_path = Path(config_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = config_path.read_text() if config_path.is_file() else ""
+    begin, end = _codex_markers(name)
+
+    # Strip any prior managed block for this server (idempotent re-install).
+    if begin in existing and end in existing:
+        head, _, rest = existing.partition(begin)
+        _, _, tail = rest.partition(end)
+        existing = head.rstrip("\n") + ("\n" + tail.lstrip("\n") if tail.strip() else "")
+
+    block = f"{begin}\n{_render_codex_table(name, spec)}{end}\n"
+    sep = "" if existing == "" or existing.endswith("\n") else "\n"
+    config_path.write_text(existing + sep + block)
+
+
+def _codex_config_has(config_path: Path, name: str) -> bool:
+    """True when the codex config.toml declares ``[mcp_servers.<name>]``.
+
+    Fail-closed by construction: a missing/unreadable/malformed config yields
+    False, so a genuinely MCP-less codex concierge stays degraded at the gate.
+    Uses stdlib ``tomllib`` (read-only; 3.11+, our floor).
+    """
+    import tomllib
+
+    try:
+        data = tomllib.loads(Path(config_path).read_text())
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return False
+    table = data.get(_CODEX_MCP_TABLE)
+    return isinstance(table, dict) and name in table
+
+
+def _read_codex_mcp_servers(config_path: Path) -> dict:
+    """Read the ``[mcp_servers.<name>]`` tables from codex's config.toml.
+
+    The inverse of the renderer — returns the FULL ``{name: spec}`` map the
+    enumerate seam probes. Fail-closed: ``{}`` on any unreadable/malformed
+    config so enumeration degrades safely (never crashes boot).
+    """
+    import tomllib
+
+    try:
+        data = tomllib.loads(Path(config_path).read_text())
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return {}
+    table = data.get(_CODEX_MCP_TABLE)
+    return {k: v for k, v in table.items() if isinstance(v, dict)} if isinstance(table, dict) else {}
+
+
+def _materialize_codex_persona(config_path: Path, persona: str) -> Path:
+    """Codex — write the persona to ``<configs>/AGENTS.md`` (the AAIF convention
+    codex reads from its project directory). Verbatim from
+    persona_render.materialize_codex_persona + _write_persona_file."""
+    target = Path(config_path) / _CODEX_PERSONA_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = persona if persona.endswith("\n") else persona + "\n"
+    target.write_text(body, encoding="utf-8")
+    return target
+
 
 class CodexAdapter(BaseAdapter):
     """Adapter that proxies A2A turns to a persistent codex app-server."""
@@ -343,14 +500,30 @@ class CodexAdapter(BaseAdapter):
         create_workspace 401s/no-ops even though the server is declared.
 
         Fix: resolve those values at install time and merge them as LITERALS
-        into the spec's ``env`` block before the base renderer writes the codex
+        into the spec's ``env`` block before the codex renderer writes the codex
         ``[mcp_servers.<name>.env]`` sub-table — the exact pattern the hardcoded
         ``[mcp_servers.molecule]`` a2a block uses for WORKSPACE_ID / PLATFORM_URL
         (codex_mcp_config.sh). Values already present in the plugin descriptor's
         env (e.g. MOLECULE_MCP_MODE) are preserved and win, so this only fills
-        the whitelist-dropped gaps. The base hook then dispatches on self.name()
-        == "codex" to render_codex_config (~/.codex/config.toml).
+        the whitelist-dropped gaps.
+
+        ADR-004: this override now renders codex's config.toml DIRECTLY via the
+        adapter-owned :func:`_render_codex_config` (was ``super()`` → engine
+        mcp_render dispatch). The adapter is self-contained — it owns its
+        renderer so the codex install works without the engine's per-runtime
+        dispatch table. The privileged-env enrichment
+        (``inject_privileged_env``) that the base funnel applies for the
+        management MCP is preserved here explicitly (no-op for non-management
+        names; idempotent + descriptor-wins), so a direct caller of this hook
+        (e.g. the ensure-management-MCP self-heal) still gets the enriched spec.
         """
+        from molecule_runtime.privileged_mcp_env import inject_privileged_env
+
+        # Belt-and-suspenders: enrich the privileged MCP spec for any caller that
+        # invokes this hook DIRECTLY (not only via install_plugins_via_registry's
+        # funnel). No-op for non-management names; idempotent + descriptor-wins.
+        spec = inject_privileged_env(name, spec)
+
         spec = dict(spec)
         descriptor_env = dict(spec.get("env") or {})
 
@@ -374,7 +547,87 @@ class CodexAdapter(BaseAdapter):
 
         if descriptor_env:
             spec["env"] = descriptor_env
-        return super().register_mcp_server_hook(config, name, spec)
+
+        target = _codex_path(config.config_path)
+        _render_codex_config(target, name, spec)
+        logger.info(
+            "register_mcp_server_hook: wired MCP %r into %s (runtime=codex)",
+            name, target,
+        )
+
+    # ------------------------------------------------------------------
+    # ADR-004 adapter-socket: the rest of the codex MCP + persona seam,
+    # owned by this adapter (relocated from mcp_render / persona_render).
+    # ------------------------------------------------------------------
+    def mcp_settings_path(self, config: AdapterConfig) -> str:
+        """Absolute native MCP-config file codex reads (~/.codex/config.toml).
+
+        Adapter-owned (was mcp_render.mcp_settings_path_for dispatch). ``config``
+        is accepted for socket uniformity; codex resolves ``$HOME`` and ignores
+        ``config.config_path``."""
+        return str(_codex_path(config.config_path))
+
+    def management_mcp_present(self, config: AdapterConfig) -> bool:
+        """True when the ``molecule-platform`` management MCP is declared in
+        codex's native config.toml (the RCA#2970 online-gate probe for codex).
+
+        Adapter-owned (was mcp_render.management_mcp_present_for dispatch).
+        Fail-CLOSED: a missing/unreadable/malformed config → False."""
+        from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
+
+        return _codex_config_has(_codex_path(config.config_path), MANAGEMENT_MCP_NAME)
+
+    async def enumerate_loaded_mcp_tools(self, config: AdapterConfig):
+        """Enumerate the LOADED MCP tool ids from codex's native config.toml.
+
+        Adapter-owned (was the base default's mcp_render.read_mcp_servers_for
+        switch). Reads codex's own ``[mcp_servers.*]`` map and hands the resolved
+        ``{name: spec}`` to the shared boot-safe stdio probe engine
+        (``enumerate_from_specs_async``) — the generic, runtime-name-free engine
+        the platform keeps. Preserves the TRI-STATE (None / [] / [ids]) +
+        never-raise + boot-safety guarantees (they live in the shared engine)."""
+        from molecule_runtime.loaded_mcp_tools_probe import (
+            enumerate_from_specs_async,
+        )
+
+        try:
+            servers = _read_codex_mcp_servers(_codex_path(config.config_path))
+        except Exception:  # noqa: BLE001 — enumeration must never crash boot
+            logger.warning(
+                "codex enumerate_loaded_mcp_tools: could not read declared MCP "
+                "servers — leaving producer unset (grace window applies)",
+                exc_info=True,
+            )
+            return None
+        return await enumerate_from_specs_async(servers)
+
+    def materialize_persona(self, config: AdapterConfig):
+        """Materialize the canonical persona into codex's native AGENTS.md.
+
+        Adapter-owned (was persona_render.materialize_persona_for dispatch). The
+        persona is read runtime-agnostically from the delivered
+        ``config.prompt_files`` via the shared engine helper
+        ``read_canonical_persona`` (a generic, runtime-name-free helper the
+        engine keeps). Best-effort: returns ``None`` (no-op) when no persona is
+        delivered, never clobbering codex's baked default with an empty
+        identity."""
+        from molecule_runtime import persona_render
+
+        persona = persona_render.read_canonical_persona(
+            config.config_path, config.prompt_files
+        )
+        if not (persona or "").strip():
+            logger.info(
+                "materialize_persona: no canonical persona delivered for codex "
+                "— leaving AGENTS.md untouched",
+            )
+            return None
+        target = _materialize_codex_persona(Path(config.config_path), persona)
+        logger.info(
+            "materialize_persona: wrote codex persona (%d chars) to %s",
+            len(persona), target,
+        )
+        return target
 
     async def create_executor(self, config: AdapterConfig):
         from executor import CodexAppServerExecutor
