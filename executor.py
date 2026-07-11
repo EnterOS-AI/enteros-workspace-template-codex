@@ -59,6 +59,19 @@ except ImportError:  # pragma: no cover - older local runtime without #3082
     def set_loaded_mcp_tools(_tools):  # type: ignore[misc]
         return None
 
+try:
+    from molecule_runtime.tool_trace import emit_tool_call
+except ImportError:  # pragma: no cover - older local runtime without ADR-004 emit
+    # ADR-004: the engine owns the shared tool-call display primitive
+    # (molecule_runtime.tool_trace.emit_tool_call). On an older base image that
+    # predates it, degrade to a no-op coroutine so the canvas simply shows no
+    # ToolTraceChip — never a hard failure. Async so callers can await/schedule
+    # it identically to the real primitive.
+    async def emit_tool_call(  # type: ignore[misc]
+        name, summary=None, status="ok"
+    ):
+        return None
+
 from app_server import AppServerError, AppServerProcess
 
 logger = logging.getLogger(__name__)
@@ -181,6 +194,57 @@ def _record_tool_activity() -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def _schedule_tool_emit(loop: asyncio.AbstractEventLoop, name: str) -> None:
+    """Fire-and-forget the engine's ``emit_tool_call`` from the sync notify path.
+
+    ADR-004: the workspace canvas renders a ``ToolTraceChip`` only from an
+    ``agent_log`` activity row that the engine's ``emit_tool_call`` primitive
+    POSTs. codex's ``on_notification`` — the one place with a completed tool
+    item's identity in hand — is a **synchronous** callback dispatched from the
+    app-server reader task, so it cannot ``await`` the coroutine directly.
+    Schedule it as a detached task on the running loop instead.
+
+    ``loop.call_soon_threadsafe`` is used (rather than a bare ``create_task``)
+    to mirror how this handler already hands work back to the loop
+    (``state.completed.set``): it is correct whether the reader is on this loop
+    or, defensively, ever migrated to its own thread. The scheduled coroutine is
+    itself best-effort and swallows every exception, so the only thing that can
+    go wrong here is loop teardown mid-turn — hence the guarded ``create_task``.
+
+    A falsy ``name`` no-ops (nothing renderable). Never raises: telemetry must
+    never break the notification loop or the turn.
+    """
+    if not name:
+        return
+
+    def _spawn() -> None:
+        try:
+            loop.create_task(emit_tool_call(name))
+        except Exception:  # noqa: BLE001 — telemetry must never break a turn
+            logger.debug("emit_tool_call schedule skipped", exc_info=True)
+
+    try:
+        loop.call_soon_threadsafe(_spawn)
+    except Exception:  # noqa: BLE001 — loop closed / shutting down
+        logger.debug("emit_tool_call schedule skipped (loop unavailable)")
+
+
+def _legacy_tool_name(mtype: str) -> str:
+    """Tool name for a 0.72-schema ``*_begin`` tool event (ADR-004 emit).
+
+    Strips the ``_begin`` edge suffix from the legacy event type so the emitted
+    ``method`` is the tool's name rather than the begin-marker: ``exec_command_
+    begin`` → ``exec_command``, ``patch_apply_begin`` → ``patch_apply``,
+    ``mcp_tool_call_begin`` → ``mcp_tool_call``. Used only for the downgrade /
+    vendor-variant legacy branch; the deployed 0.130 binary emits richer
+    ``item/completed`` items handled elsewhere with the full MCP id.
+    """
+    m = mtype or ""
+    if m.endswith("_begin"):
+        m = m[: -len("_begin")]
+    return m
 
 
 def _mcp_tool_id_from_item(item: dict) -> str | None:
@@ -835,8 +899,18 @@ class CodexAppServerExecutor(AgentExecutor):
                 # RC #203 (tier-C liveness): a completed tool item (MCP or
                 # built-in) is liveness — bump the activity file so a long
                 # tool-running turn isn't mistaken for a stall. No-op off-kernel.
-                if tid or _is_tool_activity(item.get("type", "")):
+                itype = item.get("type", "")
+                if tid or _is_tool_activity(itype):
                     _record_tool_activity()
+                    # ADR-004: this is the PRIMARY tool-call emit site. A
+                    # completed tool item carries the tool's identity, so emit
+                    # exactly ONE agent_log row per call here (rather than on
+                    # item/started or item/updated, which would double/triple-
+                    # emit). For MCP tools the ``mcp__server__tool`` id is the
+                    # method — matching the ``mcp__`` naming claude-code records;
+                    # for a built-in tool item the item ``type`` (command_
+                    # execution / file_change / web_search / …) is the method.
+                    _schedule_tool_emit(loop, tid or itype)
                 return
             if method == "turn/completed":
                 # 0.130's equivalent of `task_complete`. Codex emits
@@ -900,6 +974,19 @@ class CodexAppServerExecutor(AgentExecutor):
                 # keeps the lease fresh. No-op off-kernel (env var unset).
                 if _is_tool_activity(mtype):
                     _record_tool_activity()
+                    # ADR-004: emit for the legacy (downgrade / vendor-variant)
+                    # schema too. A tool call surfaces here as a *_begin /
+                    # *_end pair; emit ONCE — on the *_begin edge only — so the
+                    # paired *_end doesn't produce a second chip for the same
+                    # call. Name = the MCP id when the payload names a server/
+                    # tool, else the *_begin marker with the edge suffix
+                    # stripped (exec_command, patch_apply, web_search, …).
+                    if mtype.endswith("_begin"):
+                        _schedule_tool_emit(
+                            loop,
+                            _mcp_tool_id_from_item(msg)
+                            or _legacy_tool_name(mtype),
+                        )
                 logger.debug("codex event: %s %s", mtype, msg)
 
         unsubscribe = self._app_server.subscribe(on_notification)
