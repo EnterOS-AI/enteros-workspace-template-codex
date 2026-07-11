@@ -932,3 +932,206 @@ async def test_tool_item_no_activity_file_off_kernel(tmp_path, monkeypatch) -> N
     await driver_task
 
     assert list(tmp_path.iterdir()) == [], "off-kernel must not create an activity file"
+
+
+# ── ADR-004: SDK-owned tool-call display (agent_log emit) ────────────────────
+# The workspace canvas renders a persistent ToolTraceChip (and the live progress
+# line) ONLY from an agent_log activity row the engine's emit_tool_call primitive
+# POSTs. Before ADR-004 only claude-code emitted these; codex emitted nothing
+# renderable. The executor must now call emit_tool_call at its tool site — once
+# per completed tool item, with the right `method` name — for every codex schema
+# variant (0.130 item/completed + 0.72 legacy *_begin), and never double-emit.
+#
+# on_notification is a SYNC callback dispatched from the reader task, so the emit
+# is scheduled onto the loop (call_soon_threadsafe → create_task). These tests
+# monkeypatch executor.emit_tool_call with an async recorder and drain the loop
+# after the turn so the scheduled emits have run before we assert.
+
+import executor as _exec_mod  # noqa: E402
+
+
+class _EmitRecorder:
+    """Async stand-in for engine emit_tool_call that records (name) calls."""
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+        self.raise_on_call = False
+
+    async def __call__(self, name, summary=None, status="ok"):
+        self.names.append(name)
+        if self.raise_on_call:
+            raise RuntimeError("simulated platform blip")
+
+
+async def _drain_scheduled_emits() -> None:
+    """Yield control so call_soon_threadsafe callbacks + spawned emit tasks run.
+
+    The emit is a two-hop schedule (call_soon_threadsafe → create_task → await
+    coroutine); a couple of loop passes are enough for the recorder to fire.
+    """
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_completed_mcp_tool_item_emits_agent_log(monkeypatch) -> None:
+    """codex 0.130: a completed MCP tool item emits one agent_log row whose
+    method is the ``mcp__server__tool`` id (matches claude-code's MCP naming)."""
+    rec = _EmitRecorder()
+    monkeypatch.setattr(_exec_mod, "emit_tool_call", rec)
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push(
+            "item/completed",
+            {"item": {"type": "mcp_tool_call", "server": "molecule", "tool": "delegate_task"}},
+        )
+        fake.push_task_complete("done")
+
+    driver_task = asyncio.create_task(driver())
+    await ex._run_turn("do a delegation")
+    await driver_task
+    await _drain_scheduled_emits()
+
+    assert rec.names == ["mcp__molecule__delegate_task"]
+
+
+@pytest.mark.asyncio
+async def test_completed_builtin_tool_item_emits_with_item_type(monkeypatch) -> None:
+    """codex 0.130: a completed built-in (non-MCP) tool item emits with the item
+    ``type`` as method (there is no mcp__ id for built-ins)."""
+    rec = _EmitRecorder()
+    monkeypatch.setattr(_exec_mod, "emit_tool_call", rec)
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push(
+            "item/completed",
+            {"item": {"type": "command_execution", "command": "pytest -q"}},
+        )
+        fake.push_task_complete("done")
+
+    driver_task = asyncio.create_task(driver())
+    await ex._run_turn("run the tests")
+    await driver_task
+    await _drain_scheduled_emits()
+
+    assert rec.names == ["command_execution"]
+
+
+@pytest.mark.asyncio
+async def test_message_item_does_not_emit(monkeypatch) -> None:
+    """A completed agent_message item is NOT a tool call — it must emit nothing,
+    so the canvas doesn't render a phantom chip for the model's reply text."""
+    rec = _EmitRecorder()
+    monkeypatch.setattr(_exec_mod, "emit_tool_call", rec)
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push(
+            "item/completed",
+            {"item": {"type": "agent_message", "message": "all done"}},
+        )
+        fake.push_task_complete("done")
+
+    driver_task = asyncio.create_task(driver())
+    await ex._run_turn("say hi")
+    await driver_task
+    await _drain_scheduled_emits()
+
+    assert rec.names == []
+
+
+@pytest.mark.asyncio
+async def test_completed_tool_item_emits_exactly_once(monkeypatch) -> None:
+    """A tool call surfaces as item/started → item/updated → item/completed.
+    Only item/completed emits, so a single call produces exactly ONE chip."""
+    rec = _EmitRecorder()
+    monkeypatch.setattr(_exec_mod, "emit_tool_call", rec)
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    tool_item = {"type": "mcp_tool_call", "server": "molecule", "tool": "delegate_task"}
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push("item/started", {"item": tool_item})
+        fake.push("item/updated", {"item": tool_item})
+        fake.push("item/completed", {"item": tool_item})
+        fake.push_task_complete("done")
+
+    driver_task = asyncio.create_task(driver())
+    await ex._run_turn("do a delegation")
+    await driver_task
+    await _drain_scheduled_emits()
+
+    assert rec.names == ["mcp__molecule__delegate_task"], (
+        "started/updated must not emit; only the completed item does"
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_072_begin_emits_once_end_does_not(monkeypatch) -> None:
+    """codex 0.72: tool work is a *_begin / *_end pair under codex/event/.
+    Emit once on *_begin (with the edge suffix stripped); *_end must NOT
+    produce a second chip for the same call."""
+    rec = _EmitRecorder()
+    monkeypatch.setattr(_exec_mod, "emit_tool_call", rec)
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push(
+            "codex/event/exec_command_begin",
+            {"msg": {"type": "exec_command_begin", "command": "pytest -q"}},
+        )
+        fake.push(
+            "codex/event/exec_command_end",
+            {"msg": {"type": "exec_command_end", "exit_code": 0}},
+        )
+        fake.push_task_complete("done")
+
+    driver_task = asyncio.create_task(driver())
+    await ex._run_turn("run the tests")
+    await driver_task
+    await _drain_scheduled_emits()
+
+    assert rec.names == ["exec_command"], (
+        "legacy begin emits the stripped tool name once; end must not re-emit"
+    )
+
+
+@pytest.mark.asyncio
+async def test_emit_failure_never_breaks_the_turn(monkeypatch) -> None:
+    """emit_tool_call is best-effort: if it raises (platform blip), the turn
+    still assembles and returns its text — telemetry loss never aborts work."""
+    rec = _EmitRecorder()
+    rec.raise_on_call = True
+    monkeypatch.setattr(_exec_mod, "emit_tool_call", rec)
+    fake = FakeAppServer()
+    ex = _make_executor(fake)
+
+    async def driver() -> None:
+        await _wait_for_method(fake, "turn/start")
+        fake.push(
+            "item/completed",
+            {"item": {"type": "mcp_tool_call", "server": "molecule", "tool": "delegate_task"}},
+        )
+        fake.push_delta("all ")
+        fake.push_delta("done")
+        fake.push_task_complete()
+
+    driver_task = asyncio.create_task(driver())
+    text = await ex._run_turn("do a delegation")
+    await driver_task
+    await _drain_scheduled_emits()
+
+    assert text == "all done", "a raising emit must not corrupt the turn result"
+    assert rec.names == ["mcp__molecule__delegate_task"]
