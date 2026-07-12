@@ -77,6 +77,7 @@ ARG RUNTIME_VERSION=
 ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 COPY requirements.txt .
+COPY scripts/prepare_runtime_requirements.py /tmp/prepare_runtime_requirements.py
 # The codex runtime is registered the SAME way hermes/claude-code do
 # it: ENV ADAPTER_MODULE=adapter (set below) — the runtime's adapter
 # discovery loads adapter.py and `CodexAdapter.name()` ("codex") is
@@ -101,8 +102,8 @@ COPY requirements.txt .
 # receives that local wheel explicitly and resolves all public dependencies from
 # the default index.
 RUN set -eux; \
-    runtime_requirement="$(grep -Eim1 '^[[:space:]]*molecules[-_.]workspace[-_.]runtime([[:space:]]|[<>=!~])' requirements.txt \
-      | sed -E 's/[[:space:]]+#.*$//' | tr -d '[:space:]')"; \
+    runtime_requirement="$(python3 /tmp/prepare_runtime_requirements.py \
+      requirements.txt /tmp/template-requirements.txt)"; \
     if [ -n "${RUNTIME_VERSION}" ]; then \
       runtime_requirement="molecules-workspace-runtime==${RUNTIME_VERSION}"; \
     fi; \
@@ -113,8 +114,10 @@ RUN set -eux; \
       --index-url "${MOLECULE_RUNTIME_INDEX}" \
       --dest /tmp/molecule-runtime "${runtime_requirement}"; \
     test "$(find /tmp/molecule-runtime -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1; \
-    pip install --isolated --no-cache-dir /tmp/molecule-runtime/*.whl -r requirements.txt; \
-    rm -rf /tmp/molecule-runtime; \
+    pip install --isolated --no-cache-dir /tmp/molecule-runtime/*.whl \
+      -r /tmp/template-requirements.txt; \
+    rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt \
+      /tmp/prepare_runtime_requirements.py; \
     python3 -c "import molecule_runtime.preflight as pf; s=getattr(pf,'SUPPORTED_RUNTIMES',None); s.add('codex') if isinstance(s,set) else None; print('preflight SUPPORTED_RUNTIMES shim:', 'patched' if isinstance(s,set) else 'n/a (adapter-module discovery is authoritative)')" || true
 
 # --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---

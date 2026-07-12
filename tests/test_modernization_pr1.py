@@ -324,7 +324,8 @@ def test_runtime_wheel_is_acquired_from_private_index_only() -> None:
     assert '--index-url "${MOLECULE_RUNTIME_INDEX}"' in df
     assert "--extra-index-url" not in df
     assert "/tmp/molecule-runtime/*.whl" in df
-    assert "-r requirements.txt" in df
+    assert "prepare_runtime_requirements.py" in df
+    assert "-r /tmp/template-requirements.txt" in df
 
 
 # --- Group 4: wire_api regression guard (internal#513) ---------------------
