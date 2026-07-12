@@ -27,13 +27,19 @@ def prepare(source: Path, destination: Path) -> str:
 
     for index, raw in enumerate(lines):
         candidate = _without_comment(raw)
-        if not candidate or candidate.startswith("-"):
+        if not candidate:
             continue
+        if candidate.startswith("-"):
+            raise ValueError(f"pip requirement directive at line {index + 1}")
+        if candidate.endswith("\\"):
+            raise ValueError(f"requirement continuation at line {index + 1}")
         try:
             requirement = Requirement(candidate)
         except InvalidRequirement as exc:
             raise ValueError(f"unsupported requirement at line {index + 1}: {raw}") from exc
         name = canonicalize_name(requirement.name)
+        if requirement.url is not None:
+            raise ValueError(f"direct URL requirement at line {index + 1}")
         if name == canonicalize_name(RETIRED_RUNTIME_PROJECT):
             raise ValueError(f"retired runtime distribution at line {index + 1}")
         if name == canonicalize_name(RUNTIME_PROJECT):
@@ -46,8 +52,6 @@ def prepare(source: Path, destination: Path) -> str:
         )
 
     runtime_index, runtime = runtime_entries[0]
-    if runtime.url is not None:
-        raise ValueError("runtime direct URL is forbidden; use the private index")
     if runtime.extras or runtime.marker is not None:
         raise ValueError("runtime extras and environment markers are forbidden")
 
