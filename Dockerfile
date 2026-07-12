@@ -66,14 +66,15 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# RUNTIME_VERSION arg matches hermes/openclaw conventions — when set
-# (cascade-triggered builds), it pins the exact runtime version PyPI
-# just published. Including it as ARG changes the cache key for the
-# pip install layer below — without this, identical Dockerfile +
+# RUNTIME_VERSION arg matches the other official adapters — when set
+# (cascade-triggered builds), it pins the exact runtime version the private
+# registry just published. Including it as ARG changes the cache key for the
+# runtime wheel layer below — without this, identical Dockerfile +
 # requirements.txt would let docker reuse the cached layer with the
 # previous version baked in (the cache trap that bit us 5x on
 # 2026-04-27 — see runtime publish pipeline gates memory).
 ARG RUNTIME_VERSION=
+ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 COPY requirements.txt .
 # The codex runtime is registered the SAME way hermes/claude-code do
@@ -93,20 +94,27 @@ COPY requirements.txt .
 # never-fail compatibility shim for any older runtime that still gates
 # on a mutable SUPPORTED_RUNTIMES set. `|| true` so a runtime that has
 # no such attribute (the modern shape) builds clean.
-ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
-# Public deps (python-multipart, a2a-sdk, claude-agent-sdk, and the private
-# runtime's public transitive deps) live on PyPI, not the private Gitea PyPI
-# index. Add pypi.org as an --extra-index-url (NOT --index-url) so the PRIVATE
-# Gitea index stays the PRIMARY resolver for the private molecules-workspace-
-# runtime dist. Matches the accepted pattern already shipped in the hermes/
-# openclaw/langgraph templates (RFC internal#596). Without this the docker
-# build dies with "No matching distribution found for python-multipart" — a
-# real build-arg bug, NOT a runner-egress issue (robot-1 reaches pypi.org).
-ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
-RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r requirements.txt && \
+# Acquire the private runtime as a local wheel before resolving public deps.
+# pip does not prioritize index-url over extra-index-url, so a mixed-index
+# runtime solve can select a public namesake with a higher version. The isolated
+# download consults only Gitea and fetches no dependencies; the subsequent solve
+# receives that local wheel explicitly and resolves all public dependencies from
+# the default index.
+RUN set -eux; \
+    runtime_requirement="$(grep -Eim1 '^[[:space:]]*molecules[-_.]workspace[-_.]runtime([[:space:]]|[<>=!~])' requirements.txt \
+      | sed -E 's/[[:space:]]+#.*$//' | tr -d '[:space:]')"; \
     if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
-    fi && \
+      runtime_requirement="molecules-workspace-runtime==${RUNTIME_VERSION}"; \
+    fi; \
+    test -n "${runtime_requirement}"; \
+    rm -rf /tmp/molecule-runtime; \
+    mkdir -p /tmp/molecule-runtime; \
+    pip download --isolated --no-cache-dir --only-binary=:all: --no-deps \
+      --index-url "${MOLECULE_RUNTIME_INDEX}" \
+      --dest /tmp/molecule-runtime "${runtime_requirement}"; \
+    test "$(find /tmp/molecule-runtime -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1; \
+    pip install --isolated --no-cache-dir /tmp/molecule-runtime/*.whl -r requirements.txt; \
+    rm -rf /tmp/molecule-runtime; \
     python3 -c "import molecule_runtime.preflight as pf; s=getattr(pf,'SUPPORTED_RUNTIMES',None); s.add('codex') if isinstance(s,set) else None; print('preflight SUPPORTED_RUNTIMES shim:', 'patched' if isinstance(s,set) else 'n/a (adapter-module discovery is authoritative)')" || true
 
 # --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---

@@ -312,6 +312,21 @@ def test_codex_cli_pinned_to_0130_exact() -> None:
     assert "@openai/codex@^0.72" not in df
 
 
+def test_runtime_wheel_is_acquired_from_private_index_only() -> None:
+    df = (_ROOT / "Dockerfile").read_text()
+    assert (
+        "ARG MOLECULE_RUNTIME_INDEX="
+        "https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/"
+    ) in df
+    assert "pip download --isolated" in df
+    assert "--only-binary=:all:" in df
+    assert "--no-deps" in df
+    assert '--index-url "${MOLECULE_RUNTIME_INDEX}"' in df
+    assert "--extra-index-url" not in df
+    assert "/tmp/molecule-runtime/*.whl" in df
+    assert "-r requirements.txt" in df
+
+
 # --- Group 4: wire_api regression guard (internal#513) ---------------------
 # codex CLI 0.130 (baked by #219) REMOVED the `chat` WireApi variant.
 # It hard-fails config.toml parsing on `wire_api = "chat"` at the line
