@@ -102,12 +102,11 @@ COPY scripts/prepare_runtime_requirements.py /tmp/prepare_runtime_requirements.p
 # receives that local wheel explicitly and resolves all public dependencies from
 # the default index.
 RUN set -eux; \
+    runtime_project="molecules-workspace-runtime"; \
     runtime_requirement="$(python3 /tmp/prepare_runtime_requirements.py \
-      requirements.txt /tmp/template-requirements.txt)"; \
-    if [ -n "${RUNTIME_VERSION}" ]; then \
-      runtime_requirement="molecules-workspace-runtime==${RUNTIME_VERSION}"; \
-    fi; \
-    test -n "${runtime_requirement}"; \
+      requirements.txt /tmp/template-requirements.txt \
+      --runtime-version "${RUNTIME_VERSION}")"; \
+    case "${runtime_requirement}" in "${runtime_project}"*) ;; *) exit 1 ;; esac; \
     rm -rf /tmp/molecule-runtime; \
     mkdir -p /tmp/molecule-runtime; \
     pip download --isolated --no-cache-dir --only-binary=:all: --no-deps \

@@ -9,9 +9,11 @@ from pathlib import Path
 try:
     from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
     from pip._vendor.packaging.utils import canonicalize_name
+    from pip._vendor.packaging.version import InvalidVersion, Version
 except ImportError:  # pragma: no cover - local tooling may unvendor packaging
     from packaging.requirements import InvalidRequirement, Requirement
     from packaging.utils import canonicalize_name
+    from packaging.version import InvalidVersion, Version
 
 RUNTIME_PROJECT = "molecules-workspace-runtime"
 RETIRED_RUNTIME_PROJECT = "molecule-ai-workspace-runtime"
@@ -21,7 +23,7 @@ def _without_comment(raw: str) -> str:
     return re.split(r"(?<!\S)#", raw, maxsplit=1)[0].strip()
 
 
-def prepare(source: Path, destination: Path) -> str:
+def prepare(source: Path, destination: Path, *, runtime_version: str = "") -> str:
     lines = source.read_text().splitlines()
     runtime_entries: list[tuple[int, Requirement]] = []
 
@@ -56,16 +58,31 @@ def prepare(source: Path, destination: Path) -> str:
         raise ValueError("runtime extras and environment markers are forbidden")
 
     public_lines = [line for index, line in enumerate(lines) if index != runtime_index]
+    if runtime_version:
+        try:
+            version = Version(runtime_version)
+        except InvalidVersion as exc:
+            raise ValueError(f"invalid RUNTIME_VERSION: {runtime_version!r}") from exc
+        result = f"{RUNTIME_PROJECT}=={version}"
+    else:
+        result = f"{RUNTIME_PROJECT}{runtime.specifier}"
     destination.write_text("\n".join(public_lines) + ("\n" if public_lines else ""))
-    return f"{RUNTIME_PROJECT}{runtime.specifier}"
+    return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=Path)
     parser.add_argument("destination", type=Path)
+    parser.add_argument("--runtime-version", default="")
     args = parser.parse_args()
-    print(prepare(args.source, args.destination))
+    print(
+        prepare(
+            args.source,
+            args.destination,
+            runtime_version=args.runtime_version,
+        )
+    )
 
 
 if __name__ == "__main__":

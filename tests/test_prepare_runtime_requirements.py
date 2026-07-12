@@ -33,6 +33,24 @@ def test_exact_runtime_pin_is_returned_and_removed(tmp_path):
     assert destination.read_text() == "a2a-sdk==1.0.3\n"
 
 
+def test_runtime_version_override_is_exact_and_validated(tmp_path):
+    module = _load_module()
+    source = tmp_path / "requirements.txt"
+    destination = tmp_path / "public-requirements.txt"
+    source.write_text("molecules-workspace-runtime==0.3.125\n")
+
+    requirement = module.prepare(
+        source,
+        destination,
+        runtime_version="0.3.126",
+    )
+
+    assert requirement == "molecules-workspace-runtime==0.3.126"
+
+    with pytest.raises(ValueError, match="invalid RUNTIME_VERSION"):
+        module.prepare(source, destination, runtime_version="0.3.*")
+
+
 def test_runtime_direct_reference_is_rejected(tmp_path):
     module = _load_module()
     source = tmp_path / "requirements.txt"

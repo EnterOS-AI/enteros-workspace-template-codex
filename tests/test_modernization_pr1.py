@@ -326,6 +326,7 @@ def test_runtime_wheel_is_acquired_from_private_index_only() -> None:
     assert "/tmp/molecule-runtime/*.whl" in df
     assert "prepare_runtime_requirements.py" in df
     assert "-r /tmp/template-requirements.txt" in df
+    assert '--runtime-version "${RUNTIME_VERSION}"' in df
 
 
 # --- Group 4: wire_api regression guard (internal#513) ---------------------
