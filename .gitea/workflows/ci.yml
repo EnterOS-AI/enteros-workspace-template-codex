@@ -127,7 +127,62 @@ jobs:
           else:
               print("::notice::No secrets detected")
           PYEOF
-      - run: pip install pyyaml -q
+      - run: pip install pyyaml packaging -q
+      - name: Reject legacy declared-plugin installer
+        run: |
+          python3 - << 'PYEOF'
+          from pathlib import Path
+          from packaging.requirements import Requirement
+          from packaging.version import Version
+
+          boot_scripts = [
+              path for name in ("entrypoint.sh", "start.sh")
+              if (path := Path(name)).exists()
+          ]
+          executable_lines = "\n".join(
+              line
+              for path in boot_scripts
+              for line in path.read_text(encoding="utf-8").splitlines()
+              if not line.lstrip().startswith("#")
+          )
+          forbidden = (
+              "MOLECULE_DECLARED_PLUGINS",
+              "molecule_runtime.plugin_sources",
+              "install_declared_plugins",
+              "for _plg_src in $MOLECULE_DECLARED_PLUGINS",
+              "/archive/${_plg_ref}.tar.gz",
+              "Authorization: token ${MOLECULE_TEMPLATE_REPO_TOKEN}",
+              'mkdir -p "/configs/plugins/$_plg_name"',
+              'cp -a "$_plg_dir/." "/configs/plugins/$_plg_name/"',
+          )
+          found = [fragment for fragment in forbidden if fragment in executable_lines]
+          if found:
+              raise SystemExit(
+                  "legacy privileged declared-plugin installer detected: "
+                  + ", ".join(found)
+              )
+
+          runtime_version = Version(Path(".runtime-version").read_text().strip())
+          hardened_version = Version("0.4.0")
+          runtime_requirement = next(
+              Requirement(line)
+              for line in Path("requirements.txt").read_text().splitlines()
+              if line.strip().startswith("molecules-workspace-runtime")
+          )
+          if runtime_version < hardened_version:
+              raise SystemExit("runtime pin predates hardened plugin installer")
+          if runtime_version not in runtime_requirement.specifier:
+              raise SystemExit("runtime pin is outside the template requirement")
+          hardened_floor = any(
+              specifier.operator in {">=", ">", "==", "===", "~="}
+              and Version(specifier.version) >= hardened_version
+              for specifier in runtime_requirement.specifier
+          )
+          if not hardened_floor:
+              raise SystemExit("template requirement lacks a hardened runtime floor")
+          if Version("0.3.125") in runtime_requirement.specifier:
+              raise SystemExit("template requirement permits vulnerable runtime")
+          PYEOF
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
       # Shell lint the boot + provider/MCP helper scripts. These are
       # the load-bearing scripts for the codex list_peers-401 fix and
@@ -367,15 +422,13 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - run: pip install -q pytest pytest-asyncio pyyaml
+      - run: pip install -q pytest pytest-asyncio pyyaml packaging
       # The adapter credential-preflight tests (test_modernization_pr1.py)
       # import molecule_runtime.adapters.base via the _adapter fixture.
       - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
       # ADR-004 adapter-socket conformance (tests/test_conformance.py) inherits
-      # the SDK-owned battery molecule_plugin.adapter_conformance.AdapterConformance,
-      # so the SDK must be installed for the conformance test to import. Like the
-      # runtime above it is a private-index dist (molecule-ai-sdk), resolved with
-      # an EXPLICIT --extra-index-url per the hermetic dep policy (no global
-      # PIP_INDEX_URL — see the env: block).
-      - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecule-ai-sdk
+      # the SDK-owned battery molecule_plugin.adapter_conformance.AdapterConformance.
+      # Install the reviewed SDK source commit directly so conformance cannot
+      # silently drift when either the package registry or SDK main advances.
+      - run: pip install -q "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@da42c7f2dae122aaa6f34a74c13e598a87870586"
       - run: python3 -m pytest tests/ -v

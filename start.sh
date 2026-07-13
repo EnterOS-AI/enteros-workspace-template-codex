@@ -402,6 +402,10 @@ else
   echo "[start.sh] WARN: codex sandbox boot-check FAILED: ${CODEX_BOOT_CHECK_URL} -> ${boot_http} (expected 200) — codex commands may be network-blocked; verify sandbox_mode=danger-full-access in ~/.codex/config.toml" >&2
 fi
 
-# Hand off to molecule-runtime. From here, every A2A message routes
-# through executor.py → app_server.py → codex app-server child.
+# Hand off to molecule-runtime. From here, every A2A message routes through
+# executor.py → app_server.py → codex app-server child. The runtime also owns
+# declared-plugin source parsing, fetching, and atomic installation before
+# adapter setup. Runtime 0.4 rejects unsafe dot/path install names and contains
+# every resolved destination under /configs/plugins. Keep plugin installation
+# out of this privileged boot script.
 exec gosu agent molecule-runtime
