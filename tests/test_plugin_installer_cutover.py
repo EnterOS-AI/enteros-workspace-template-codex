@@ -13,7 +13,7 @@ CI_WORKFLOW = REPO_ROOT / ".gitea" / "workflows" / "ci.yml"
 RUNTIME_VERSION = REPO_ROOT / ".runtime-version"
 REQUIREMENTS = REPO_ROOT / "requirements.txt"
 HARDENED_INSTALLER_VERSION = Version("0.4.0")
-SDK_COMMIT = "3474157daca56e3de5b7" + "cffd2a2f84b78bf63b68"
+SDK_COMMIT = "da42c7f2dae122aaa6f3" + "4a74c13e598a87870586"
 
 
 def test_boot_script_does_not_implement_declared_plugin_fetching() -> None:

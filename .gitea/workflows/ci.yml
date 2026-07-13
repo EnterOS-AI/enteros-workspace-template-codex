@@ -430,5 +430,5 @@ jobs:
       # the SDK-owned battery molecule_plugin.adapter_conformance.AdapterConformance.
       # Install the reviewed SDK source commit directly so conformance cannot
       # silently drift when either the package registry or SDK main advances.
-      - run: pip install -q "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@3474157daca56e3de5b7cffd2a2f84b78bf63b68"
+      - run: pip install -q "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@da42c7f2dae122aaa6f34a74c13e598a87870586"
       - run: python3 -m pytest tests/ -v
