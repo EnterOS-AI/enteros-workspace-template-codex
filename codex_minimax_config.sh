@@ -146,10 +146,9 @@ echo "[codex-minimax] wrote ${CONFIG_TOML} model=${MODEL} provider=minimax"
 # — every subsequent A2A request piled up in the workspace-server
 # queue as "busy".
 #
-# The provisioner has a MODEL_PROVIDER pass-through (ec2.go:1923) but
-# never exports it from user-data, so the only path for a runtime to
-# get the right model is to patch config.yaml from the install-time
-# context that knows about MINIMAX_API_KEY.
+# Some workspace configurations omit the resolved model while retaining
+# provider context, so this boot-time helper patches config.yaml from the
+# environment that already knows about MINIMAX_API_KEY.
 WORKSPACE_CONFIG_DIR="${WORKSPACE_CONFIG_PATH:-/configs}"
 WORKSPACE_CONFIG="${WORKSPACE_CONFIG_DIR}/config.yaml"
 if [ -f "$WORKSPACE_CONFIG" ] && [ -w "$WORKSPACE_CONFIG_DIR" ]; then

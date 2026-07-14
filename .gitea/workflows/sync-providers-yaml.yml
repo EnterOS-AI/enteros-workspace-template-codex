@@ -22,10 +22,9 @@ name: sync-providers-yaml
 # "registry-canonical drift not caught here; subset gate still runs" rather
 # than a hard red that blocks unrelated PRs.
 #
-# Why /raw not /contents: Gitea 1.22.6 ignores
-# `Accept: application/vnd.gitea.raw` on /contents and returns a JSON+base64
-# envelope, which would make this diff a permanent false RED. The /raw endpoint
-# returns the file bytes directly (precedent: molecule-core
+# Why /raw not /contents: /contents returns a JSON+base64 envelope, which
+# would make this diff a permanent false RED. The /raw endpoint returns the
+# file bytes directly (precedent: molecule-core
 # .gitea/workflows/sync-providers-yaml.yml).
 
 on:
@@ -80,10 +79,8 @@ jobs:
             exit 0
           fi
           CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-controlplane/raw/internal/providers/providers.yaml?ref=main"
-          # /raw endpoint: returns the file bytes directly. /contents returns
-          # a JSON+base64 envelope on Gitea 1.22.6 even with vnd.gitea.raw —
-          # that quirk caused a permanent false RED on the molecule-core
-          # precedent before the /raw switch.
+          # /raw returns file bytes directly; /contents returns a JSON+base64
+          # envelope that is not suitable for a byte-for-byte diff.
           curl -fsS \
             -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
             "${CANON_URL}" -o /tmp/canonical-providers.yaml

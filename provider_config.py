@@ -248,12 +248,8 @@ def assert_model_is_not_provider_name(
                 f"Provider registry names (do NOT pass these as "
                 f"`model:`): {known}\n"
                 f"\n"
-                f"Fix path: update the workspace-config writer in "
-                f"molecule-controlplane "
-                f"(internal/provisioner/userdata_containerized.go's "
-                f"buildModelProviderYAML and "
-                f"internal/provisioner/ec2.go's MODEL_PROVIDER "
-                f"persistence block) to write the MODEL env value "
+                f"Fix path: update the molecule-controlplane "
+                f"workspace-config writer to write the MODEL env value "
                 f"(real model id, e.g. 'gpt-5.5') into `model:` and "
                 f"the MODEL_PROVIDER env value (registry provider "
                 f"name, e.g. {provider['name']!r}) into `provider:` "
@@ -265,9 +261,10 @@ def load_providers(workspace_config_path: str = "") -> tuple:
     """Read the provider registry from the template's ``config.yaml``.
 
     Resolution order mirrors the claude-code template's ``_load_providers``:
-      1. ``/opt/adapter/config.yaml`` — the canonical provisioner-managed
-         install path (Docker mount and EC2-host clone both land here).
-      2. Adjacent to this file's ``__file__`` — dev/test path.
+      1. ``/opt/adapter/config.yaml`` — compatibility path for older and
+         explicitly self-managed installs.
+      2. Adjacent to this file's ``__file__`` — current published-image
+         path (``/app/config.yaml``) and the normal dev/test path.
       3. Per-workspace ``<workspace_config_path>/config.yaml`` — operator
          override on private deployments.
       4. ``_BUILTIN_PROVIDERS`` — last-resort fallback so a bare-bones

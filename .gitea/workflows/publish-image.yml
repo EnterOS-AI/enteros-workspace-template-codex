@@ -3,25 +3,19 @@ name: publish-image
 # Builds the codex workspace template Dockerfile and pushes it to the Gitea registry (registry.moleculesai.app) as
 # `<REGISTRY>/molecule-ai/workspace-template-codex:latest` + `:sha-<7>`.
 #
-# Ported verbatim in shape from the live-verified claude-code template
-# publish-image.yml (PR#25 / bbc2dae). The codex repo had NO publish
-# pipeline before this — the deployed prod image
-# sha256:877e0687704cbfdd0f5fca367131088746a68c3d4fccd0d18a74863773530815
-# (git 99e7f13) was the 2026-05-06 ECR-mirror rollback built
-# pre-suspension from GitHub and NEVER rebuilt post-suspension because
-# this workflow did not exist. This file restores the build path so a
-# merge to main produces a fresh, T4-baked, list_peers-working image.
+# This follows the live-verified claude-code publish shape. A merge to
+# main builds the current T4-capable image, publishes it to Gitea OCI,
+# and promotes the resulting content-addressed pin.
 #
-# Cross-repo `uses:` is BLOCKED on Gitea 1.22.6 (DEFAULT_ACTIONS_URL=
-# github → 404; feedback_gitea_cross_repo_uses_blocked) so the
-# publish-template-image logic is inlined.
+# The publish flow remains repository-local because its co-located registry
+# endpoint, smoke gate, and pin promotion are template-specific.
 #
-# Registry: production uses ECR. The ECR repo
-# `molecule-ai/workspace-template-codex` already exists (the migration
-# sweep created it; that is where sha256:877e0687 lives today).
+# The canonical pull host is registry.moleculesai.app; the co-located
+# runner pushes through localhost:3200 to bypass Cloudflare's
+# request-body limit for large layers.
 #
-# Gitea 1.22.6 hostile-shape checklist applied:
-#   - No workflow_dispatch.inputs (silently rejected on 1.22.6)
+# Workflow compatibility choices:
+#   - No workflow_dispatch.inputs
 #   - No merge_group: trigger
 #   - No cross-repo uses:
 #   - GITHUB_SERVER_URL pinned at workflow level
@@ -151,8 +145,7 @@ jobs:
           echo "::notice::no bare imports of runtime modules in *.py files"
 
       - name: Log in to our container registry (Gitea OCI - CF-bypass local push endpoint)
-        # ECR retired (operator directive: use our own registry). Push to the
-        # Gitea-backed OCI registry at registry.moleculesai.app. The push
+        # Push to the Gitea-backed OCI registry at registry.moleculesai.app. The push
         # credential is the Gitea package-publisher, fetched from the Infisical
         # SSOT via the CI bootstrap trio (INFISICAL_CI_*) — never hardcoded.
         # FORK SAFETY: this workflow has no pull_request trigger (push:[main] +
@@ -266,10 +259,9 @@ jobs:
 
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to
-    # runtime_image_pins via the control-plane admin endpoint. Gitea 1.22.x
-    # has no `workflow_run`, so promotion has to be a job in this same
-    # workflow (cannot be a separate workflow listening on publish-image
-    # success). Gated on `if: success()` so a failed publish (smoke red,
+    # runtime_image_pins via the control-plane admin endpoint. Promotion stays
+    # in this workflow so it consumes the exact published digest across the
+    # `needs:` edge. Gated on `if: success()` so a failed publish (smoke red,
     # push red) never bumps any pin — promotion only runs AFTER a green
     # build/push.
     #

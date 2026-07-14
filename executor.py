@@ -555,9 +555,9 @@ class CodexAppServerExecutor(AgentExecutor):
             # `danger-full-access` bypasses bwrap entirely → no netns
             # setup → network works → agent can `git clone` / `curl`
             # Gitea + GitHub for PR review and code fetches. The
-            # workspace agent runs as uid-1000 inside a per-tenant EC2
-            # so blast radius is bounded to the workspace's own
-            # filesystem + that one EC2's network identity.
+            # workspace agent runs as uid-1000 inside its assigned workspace
+            # container, so blast radius is bounded to that workspace's
+            # persisted files and host network identity.
             #
             # Tracked: file follow-up in molecule-controlplane to add
             # NET_ADMIN to the codex container run args, then revert
