@@ -1,19 +1,13 @@
 name: CI
 
-# Codex workspace template CI — ported verbatim in shape from the
-# live-verified claude-code template ci.yml (commit bbc2dae / PR#25)
-# and the in-flight hermes PR#26 / openclaw PR#19. The codex repo had
-# NO .gitea/workflows at all before this (single-commit stale mirror;
-# the deployed prod image sha256:877e0687 / git 99e7f13 was built
-# pre-suspension from GitHub and never rebuilt post-suspension because
-# this pipeline did not exist). This file adds the missing pipeline.
+# Codex workspace-template CI. The jobs keep protected context names stable,
+# clone canonical validation code from molecule-ci, and make runner
+# requirements explicit.
 #
-# Gitea 1.22.6 hostile-shape checklist applied (same as siblings):
-#   - No `workflow_dispatch.inputs` (silently rejected on 1.22.6)
+# Workflow compatibility choices:
+#   - No `workflow_dispatch.inputs`
 #   - No `merge_group:` trigger
-#   - No cross-repo `uses:` (DEFAULT_ACTIONS_URL=github 404s — the
-#     canonical validator is git-cloned fresh instead;
-#     feedback_gitea_cross_repo_uses_blocked)
+#   - Canonical validator is cloned fresh instead of delegated
 #   - workflow-level GITHUB_SERVER_URL pinned
 #     (feedback_act_runner_github_server_url)
 #   - No `on.push.paths:` (would permanently block path-excluded pushes;
@@ -197,7 +191,7 @@ jobs:
   # pc2-safe: false — needs docker for Docker build smoke; routes to docker-host only
   # (task #390 B-lite — PC2 native runners advertise `ubuntu-latest` but cannot
   # docker due to npipe→Linux-container bridging gap; AND-match on both labels
-  # excludes them while keeping the Linux operator-host runners eligible.)
+  # excludes them while keeping the Linux docker-host runners eligible.)
   validate-runtime:
     name: Template validation (runtime)
     runs-on: [ubuntu-latest, docker-host]

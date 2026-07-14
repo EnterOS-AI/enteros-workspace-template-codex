@@ -174,3 +174,23 @@ def test_subset_rejects_injected_unservable_model_on_real_provider():
         prov == real_provider and model == bogus_model
         for prov, model, _ in violations
     ), f"injected bogus model must appear in violations; got {violations}"
+
+
+def test_sync_workflow_reads_auto_sync_token_from_infisical_ssot():
+    """The cross-repo drift gate must not depend on a duplicated Gitea PAT.
+
+    The three bootstrap inputs are already used by this repo's protected
+    publish workflow. Fork PRs receive none of them, so the workflow keeps its
+    existing fail-open behavior when the bootstrap trio is unavailable.
+    """
+    workflow = (
+        REPO_ROOT / ".gitea" / "workflows" / "sync-providers-yaml.yml"
+    ).read_text()
+
+    assert "secrets.AUTO_SYNC_TOKEN" not in workflow
+    assert "secrets.INFISICAL_CI_CLIENT_ID" in workflow
+    assert "secrets.INFISICAL_CI_CLIENT_SECRET" in workflow
+    assert "secrets.INFISICAL_CI_PROJECT_ID" in workflow
+    assert "Infisical CI bootstrap credentials unavailable" in workflow
+    assert "environment=prod&secretPath=%2Fshared%2Fdev-utils" in workflow
+    assert "::add-mask::$AUTO_SYNC_TOKEN" in workflow

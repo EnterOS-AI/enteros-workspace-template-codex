@@ -395,8 +395,7 @@ class CodexAdapter(BaseAdapter):
         # than letting codex thread/start accept the garbage and wedge.
         # Either side alone closes the bug — see
         # `assert_model_is_not_provider_name` doc + the structural fix
-        # in molecule-controlplane's userdata_containerized.go /
-        # ec2.go writer.
+        # in molecule-controlplane's workspace-config writer.
         assert_model_is_not_provider_name(yaml_model, providers)
 
         try:

@@ -7,8 +7,7 @@ FROM python:3.11-slim
 #   xz-utils      — Node tarball is .tar.xz
 #
 # T4 escalation leg (RFC internal#456 §9 / PR#474 — mirrors the
-# already-live-verified claude-code template image, commit 12dd604,
-# and the in-flight hermes PR#26 / openclaw PR#19):
+# live-verified sibling workspace templates):
 #   sudo + util-linux(nsenter) + docker.io(CLI) are baked here so the
 #   uid-1000 `agent` (see useradd below — UNCHANGED, agent stays
 #   uid-1000; start.sh still `exec gosu agent`) has a wired, audited
@@ -17,10 +16,8 @@ FROM python:3.11-slim
 #   container. Without sudo, a uid-1000 process in --privileged CANNOT
 #   nsenter/chroot /host (--privileged grants caps to root, not
 #   uid-1000) and cannot use the root:docker 0660 docker.sock — T4
-#   would be provisioner-shape-only (the documented ABSENT-escalation
-#   -leg gap; the codex prod pin sha256:877e0687 / git 99e7f13 is the
-#   2026-05-06 ECR-mirror rollback that PREDATES all T4 work and ships
-#   NO leg). The sudoers drop-in + docker-group add are below, after
+#   would be provisioner-shape-only. The sudoers drop-in + docker-group
+#   add are below, after
 #   useradd, so `agent` exists. This is ADDITIVE: it does NOT change
 #   the agent uid and does NOT change token ownership. The codex MCP
 #   list_peers-401 token-resolution class (RFC internal#456 §10) is
