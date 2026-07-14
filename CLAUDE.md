@@ -1,10 +1,29 @@
-# Coding Discipline (Karpathy 4)
+# Coding discipline
 
-All code changes in this workspace follow these principles:
+1. Think before coding: verify assumptions against current files and tests.
+2. Prefer the smallest change that satisfies the task.
+3. Keep edits surgical and match the existing style.
+4. Define the validation that proves the change before implementing it.
 
-1. **Think Before Coding** — State assumptions explicitly. If unclear, ask, don't guess.
-2. **Simplicity First** — Minimum code that solves the problem. No speculative abstractions.
-3. **Surgical Changes** — Only touch what the task requires. Match existing style exactly.
-4. **Goal-Driven Execution** — Define verifiable success criteria before implementing.
+# Repository guide
 
-For concrete anti-pattern examples, see the `coding-discipline` skill or `EXAMPLES.md` in the Karpathy guidelines repo.
+This is the `codex` workspace image. Its supported path is `start.sh` →
+`molecule-runtime` → `CodexAdapter` → `CodexAppServerExecutor` → persistent
+`codex app-server` child.
+
+Treat these files as the sources of truth:
+
+| Concern | Source |
+|---|---|
+| Models/providers | `config.yaml`, `provider_config.py` |
+| Container boot and auth materialization | `start.sh` |
+| Adapter preflight | `adapter.py` |
+| Turn/session behavior | `executor.py`, `app_server.py` |
+| Runtime/CLI versions | `.runtime-version`, `requirements.txt`, `Dockerfile` |
+| Delivery behavior | `.gitea/workflows/publish-image.yml` |
+| Supported local checks | `runbooks/local-dev-setup.md` and `.gitea/workflows/ci.yml` |
+
+Keep credential values out of logs and examples. Do not reintroduce a per-turn
+`codex exec` path or a second provider registry. Open a branch and pull request;
+never push directly to `main`, tag a release, or manually publish an image as
+part of routine work.
