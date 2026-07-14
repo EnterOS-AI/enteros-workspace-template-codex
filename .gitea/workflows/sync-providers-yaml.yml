@@ -15,12 +15,13 @@ name: sync-providers-yaml
 # copy must be re-synced (`internal/providers/registry_projection.py generate
 # <runtime>` regenerates the projection artifact alongside).
 #
-# AUTH: uses AUTO_SYNC_TOKEN (the existing cross-repo read token used to sync
-# canonical content across repos). If the secret is absent the job emits a
-# ::warning:: and exits 0 — the projection artifact's own subset+drift gate is
-# the always-on backstop, so a missing cross-repo token degrades to
-# "registry-canonical drift not caught here; subset gate still runs" rather
-# than a hard red that blocks unrelated PRs.
+# AUTH: reads AUTO_SYNC_TOKEN at runtime from its Infisical SSOT
+# (/shared/dev-utils, prod) using the same INFISICAL_CI_* bootstrap trio this
+# repo's protected publish workflow already uses. This avoids a duplicated
+# long-lived Gitea Actions copy drifting after token rotation. Fork PRs do not
+# receive the bootstrap trio; when it is absent the job emits a warning and
+# exits 0. The projection artifact's own subset+drift gate remains the
+# always-on backstop.
 #
 # Why /raw not /contents: /contents returns a JSON+base64 envelope, which
 # would make this diff a permanent false RED. The /raw endpoint returns the
@@ -68,20 +69,40 @@ jobs:
 
       - name: Fetch canonical providers.yaml from controlplane and byte-compare
         env:
-          AUTO_SYNC_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
           API_ROOT: ${{ github.server_url }}/api/v1
         run: |
           set -euo pipefail
-          if [ -z "${AUTO_SYNC_TOKEN:-}" ]; then
-            echo "::warning::AUTO_SYNC_TOKEN secret missing — skipping the live cross-repo compare."
+          if [ -z "${INFISICAL_CI_CLIENT_ID:-}" ] || \
+             [ -z "${INFISICAL_CI_CLIENT_SECRET:-}" ] || \
+             [ -z "${INFISICAL_PROJECT_ID:-}" ]; then
+            echo "::warning::Infisical CI bootstrap credentials unavailable — skipping the live cross-repo compare."
             echo "The projection-artifact drift gate (verify-providers-projection.yml) still gates hand-edits of the synced copy via its own regen+diff."
-            echo "Provision AUTO_SYNC_TOKEN (read scope on molecule-controlplane) to enable live canonical-drift detection."
             exit 0
+          fi
+          BASE="https://key.moleculesai.app"
+          UA="curl/8.4.0"
+          TOK=$(curl -fsS -A "$UA" --max-time 30 -X POST \
+            "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"${INFISICAL_CI_CLIENT_ID}\",\"clientSecret\":\"${INFISICAL_CI_CLIENT_SECRET}\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          AUTO_SYNC_TOKEN=$(curl -fsS -A "$UA" --max-time 30 \
+            "$BASE/api/v3/secrets/raw/AUTO_SYNC_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fdev-utils" \
+            -H "Authorization: Bearer $TOK" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -z "$AUTO_SYNC_TOKEN" ]; then
+            echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils."
+            exit 1
           fi
           CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-controlplane/raw/internal/providers/providers.yaml?ref=main"
           # /raw returns file bytes directly; /contents returns a JSON+base64
           # envelope that is not suitable for a byte-for-byte diff.
           curl -fsS \
+            -A "$UA" \
             -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
             "${CANON_URL}" -o /tmp/canonical-providers.yaml
           LOCAL=internal/providers/providers.yaml
