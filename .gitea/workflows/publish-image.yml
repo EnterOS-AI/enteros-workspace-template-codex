@@ -265,13 +265,12 @@ jobs:
     # push red) never bumps any pin — promotion only runs AFTER a green
     # build/push.
     #
-    # staging CP `runtime_image_pins` is a SEPARATE SSOT from prod, so the
-    # `E2E Staging SaaS` canary boots whatever staging's pin points at. We
-    # promote to staging (staging-api.moleculesai.app); the prod leg is removed
-    # under the prod-freeze (see the matrix comment below). `strategy.fail-fast:
-    # false` keeps each matrix leg independent and fail-LOUD on a non-2xx for ITS
-    # OWN target so a stranded pin is never hidden behind a green workflow.
-    # Mirrors the google-adk sibling (prod-freeze-aware, staging live).
+    # Target contract: staging `runtime_image_pins` is independent from
+    # production, and the staging canary boots the digest stored there. Template
+    # publication promotes only staging (staging-api.moleculesai.app).
+    # Production pin changes are separate, reviewed control-plane work and are
+    # intentionally outside this job. `strategy.fail-fast: false` keeps matrix
+    # targets isolated and fail-LOUD on a non-2xx response.
     name: Promote runtime_image_pins (CP admin)
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -283,24 +282,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # prod leg removed (prod-freeze). Prod cutover is pending-operator and
-          # the prod CP admin bearer is not provisioned to match any token these
-          # template repos hold, so POST /cp/admin/runtime-image/promote to
-          # api.moleculesai.app returns HTTP 401 by design (AdminGate bearer
-          # compare). Auto-promoting to prod during the freeze is exactly what
-          # the freeze prohibits, so this leg is de-required rather than papered
-          # over. Restore the prod include once prod cutover completes and a
-          # matching prod CP admin token is provisioned. Staging stays the live
-          # promote target. Mirrors the google-adk sibling.
+          # Template publication owns the staging target only. Production pin
+          # changes require a separate reviewed control-plane change.
           - env_name: staging
             cp_host: staging-api.moleculesai.app
     steps:
       - name: POST /cp/admin/runtime-image/promote (${{ matrix.env_name }})
         env:
+          # The sole current matrix target authenticates with
+          # CP_STAGING_ADMIN_API_TOKEN. PROD_TOKEN remains declared for the
+          # generic environment selector below, but no production matrix entry
+          # invokes it.
           PROD_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
-          # Staging CP admin token — same secret name the google-adk/claude-code
-          # siblings use (verified live: google-adk staging promote → HTTP 200).
-          # The old CP_ADMIN_API_TOKEN_STAGING name 401s (not the provisioned key).
           STAGING_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
           ENV_NAME: ${{ matrix.env_name }}
           CP_HOST: ${{ matrix.cp_host }}
@@ -352,9 +345,9 @@ jobs:
     # pushed. If they differ (promote silently skipped, wrong template, region
     # skew, 4xx that somehow didn't abort, etc.) this job goes RED. This is the
     # thing the old continue-on-error status-post could never do: it makes a
-    # missed promote impossible to hide behind a green build. Runs per
-    # environment (prod + staging) with the same isolation semantics as
-    # promote-pin. A shared, reusable copy of this gate lives in
+    # missed promote impossible to hide behind a green build. The staging target
+    # uses the same isolation semantics as promote-pin. A shared, reusable copy
+    # of this gate lives in
     # .gitea/scripts/verify-runtime-pin.sh in EVERY runtime template repo so the
     # guard covers codex/claude-code/hermes/etc., not just codex.
     name: Verify runtime_image_pins moved (fail-loud)
@@ -368,9 +361,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # prod leg removed (prod-freeze) — see the promote-pin matrix comment.
-          # There is nothing to verify on prod because nothing is promoted there
-          # during the freeze. Staging stays the live verify target.
+          # Verification follows the same staging-only target contract as
+          # promote-pin. Production verification belongs to its separate,
+          # reviewed control-plane change.
           - env_name: staging
             cp_host: staging-api.moleculesai.app
             token_secret: CP_STAGING_ADMIN_API_TOKEN
