@@ -1,0 +1,73 @@
+# CANONICAL inline meta-ci (ADVISORY) consumer workflow — molecule-ai/molecule-ci SSOT.
+#
+# This is the file a repo copies to opt into the capability→bundle router
+# (task internal#57, RFC: org CI-enforcement) in its Phase-1 ADVISORY form. Drop
+# it in as `.gitea/workflows/meta-ci-advisory.yml` and commit a `repo-meta.yaml`
+# at the repo root; nothing else changes (no branch-protection edit, no
+# required-context add).
+#
+# WHY INLINE (not `uses: molecule-ai/molecule-ci/.gitea/workflows/meta-ci.yml`):
+# cross-repo `workflow_call` is NOT a trustworthy gate on Gitea Actions 1.26.4 —
+# a consumer job can be recorded green WITHOUT running the referenced steps
+# (internal#1000). This template instead anon-clones the public molecule-ci SSOT
+# at CI time and runs the canonical `scripts/meta-ci.py` directly. Same single
+# source of truth (the router lives in molecule-ci, fetched fresh every run), no
+# cross-repo `uses:` dependency.
+#
+# WHY IT CANNOT BLOCK A MERGE (advisory contract):
+# the router step is `continue-on-error: true` and this workflow posts NO commit
+# status. The job's own auto-status is therefore always green, so on a `["*"]`
+# branch protection it adds no red-capable context (R1 verified that on 1.26.4 any
+# NON-green emitted context — or an absent explicitly-required one — blocks; a
+# perpetually-green advisory context never does). The real PASS/FAIL of the router
+# is in this job's LOG, not its status colour.
+#
+# PHASE 3 PROMOTION (owner-gated, later — NOT part of adopting this template):
+# to make meta-ci enforcing, switch to calling the reusable with `advisory: false`
+# (which posts a real-state `meta-ci / required` context and fails the job on red),
+# once cross-repo execution is proven or this inline form is given a status POST +
+# `exit`. Do NOT do that here.
+
+name: meta-ci-advisory
+
+on:
+  pull_request:
+  push:
+    branches: [main, staging]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  meta:
+    name: meta (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # ADVISORY: never block a merge while the router beds in. The router SCRIPT
+    # exits nonzero on an invalid repo-meta / failed bundle; this flag only
+    # governs whether THIS job's red blocks the PR (it does not).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
+      # Anon-clone the molecule-ci SSOT; run the CANONICAL scripts/meta-ci.py
+      # (schemas/ is its sibling there, so schema validation is intact). Direct
+      # git-clone for the cross-repo fetch — see molecule-ci validate-plugin.yml
+      # for the Gitea 1.26.4 auth reason.
+      # One guarded step that ALWAYS exits 0, so this job's auto commit-status is
+      # always green and can never block a merge (Gitea does NOT green a red step via
+      # job-level continue-on-error — the explicit `exit 0` is what guarantees it).
+      # The real router PASS/FAIL is in this log, surfaced as ::warning:: on failure.
+      - name: meta-ci router (advisory — never blocks)
+        run: |
+          set +e
+          python3 -m pip install --break-system-packages -q pyyaml jsonschema
+          git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+          if [ -f .molecule-ci-canonical/scripts/meta-ci.py ]; then
+            python3 .molecule-ci-canonical/scripts/meta-ci.py --repo-root .
+            rc=$?
+            [ "$rc" -ne 0 ] && echo "::warning::meta-ci router exited $rc — ADVISORY (not blocking this PR). See log above."
+          else
+            echo "::warning::meta-ci router not yet on molecule-ci main (lands with molecule-ci#71) — advisory no-op this run."
+          fi
+          exit 0
