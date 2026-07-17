@@ -267,32 +267,20 @@ WORKDIR /home/agent
 USER root
 WORKDIR /app
 
-# GIT_ASKPASS wiring (cp#444 prerequisite). The Dockerfile comment on the
-# molecule-askpass COPY above (and the script's own header) states "the
-# platform-side provisioner sets GIT_ASKPASS to that path" — but NO
-# molecule-controlplane provisioner ever set GIT_ASKPASS (grep of
-# internal/provisioner/*.go returns nothing). So at runtime GIT_ASKPASS was
-# unset, git never invoked the helper, and the per-agent GITEA_TOKEN that
-# cp#444 (secretsDPreferredKeys → secrets.d/load.sh) delivers was never used
-# for git-over-HTTPS — codex agents (CR2/Researcher) could not auth to Gitea.
-#
-# GIT_ASKPASS is a uniform, non-secret, per-IMAGE constant (the helper path is
-# the same in every codex container; the per-agent variation is the TOKEN
-# VALUE, delivered separately via secrets.d). That makes it a Dockerfile ENV,
-# not a per-workspace provisioner concern — and baking it into the image layer
-# means it survives container recreate/restart, which is the whole point of
-# cp#444 (the provision-time env-file is rewritten on every recreate).
-#
-# Build-safe: molecule-askpass (read at COPY above, /usr/local/bin) emits an
-# empty string and exits 0 when GIT_HTTP_PASSWORD/GITEA_TOKEN are unset — it
-# never errors. There are no authenticated build-time `git clone` steps in
-# this image (git is used only by runtime agent tools; NodeSource/pip/npm use
-# curl + the PyPI index URL, not authenticated git), so setting GIT_ASKPASS
-# cannot affect the build. It only takes effect when a runtime git invocation
-# hits an HTTPS auth challenge.
+# GIT_ASKPASS is NOT baked as an image ENV. molecule-core's
+# applyAgentGitIdentity (workspace-server/internal/handlers/agent_git_identity.go,
+# mc#1525) is the sole writer: at provision time it injects
+# `-e GIT_ASKPASS=/usr/local/bin/molecule-askpass` via setIfEmpty, so an
+# operator/workspace_secret override still wins and a workspace can opt out with
+# GIT_ASKPASS="". The former per-image `ENV GIT_ASKPASS=` here was added under
+# cp#444 BEFORE mc#1525 wired that provisioner path (the cp#444-era comment that
+# "no provisioner ever set GIT_ASKPASS" is now stale); with core as the writer
+# the image ENV is redundant, so it is removed to keep a single source of truth.
+# The helper binary itself still ships at /usr/local/bin/molecule-askpass via the
+# COPY above. Interim drift-audit fix (E1); the durable fix is a shared
+# workspace-base image (separate owner-gated RFC).
 ENV ADAPTER_MODULE=adapter \
-    PYTHONPATH=/app \
-    GIT_ASKPASS=/usr/local/bin/molecule-askpass
+    PYTHONPATH=/app
 
 # start.sh is intentionally minimal — codex doesn't need a separate
 # daemon to boot; the app-server is a stdio child spawned by
