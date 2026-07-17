@@ -246,8 +246,8 @@ jobs:
           set -euo pipefail
           SHA_REF="${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}"
           docker tag "${SHA_REF}" "${PUSH_IMAGE_NAME}:latest"
-          docker push "${PUSH_IMAGE_NAME}:latest"
-          PUSHOUT="$(docker push "${SHA_REF}")"
+          timeout 480 docker push "${PUSH_IMAGE_NAME}:latest"
+          PUSHOUT="$(timeout 480 docker push "${SHA_REF}")"
           printf '%s\n' "${PUSHOUT}"
           DIGEST="$(printf '%s\n' "${PUSHOUT}" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | head -1)"
           if [ -z "${DIGEST}" ]; then
