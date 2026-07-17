@@ -58,7 +58,9 @@ RUN set -eux; \
     chmod 0440 /etc/sudoers.d/agent-t4; \
     visudo -cf /etc/sudoers.d/agent-t4; \
     groupadd -f docker; \
+    groupadd -g 988 -f docker-host || true; \
     usermod -aG docker agent; \
+    usermod -aG docker-host agent || true; \
     id agent
 
 WORKDIR /app
