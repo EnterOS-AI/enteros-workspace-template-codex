@@ -1,0 +1,10 @@
+# repo-meta.yaml — SSOT manifest for the meta-CI capability→bundle router (internal#57).
+# Declares WHAT this repo IS (layer) and WHAT IT CAN DO (capabilities); the router
+# derives which CI bundles attach. See molecule-ci/docs/meta-ci.md.
+# ADVISORY (RFC #57 Phase 1) — non-blocking; no branch-protection change.
+schema_version: 1
+layer: runtime-template
+capabilities:
+  - adapter          # adapter.py + conformance tests -> adapter-conformance bundle
+  - mcp-server-bake  # Dockerfile pre-bakes @molecule-ai/mcp-server -> mcp-pin-lockstep bundle
+  - docker-image     # Dockerfile -> docker-build-smoke bundle
