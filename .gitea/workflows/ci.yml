@@ -178,6 +178,26 @@ jobs:
               raise SystemExit("template requirement permits vulnerable runtime")
           PYEOF
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
+      # Audit E1: scripts/molecule-askpass is byte-copied across every workspace
+      # template (no shared base image yet). Pin its sha256 so an unintentional
+      # edit — or a hand-copy that drifts from its peers — reds this PR. All
+      # templates pin the SAME value; a legitimate change must update the file
+      # AND this pin in every template together (which a reviewer sees). Always
+      # fires (validate-static has no paths filter / fork guard) and feeds the
+      # required `validate` aggregate, so it is a hard gate with no secrets.
+      - name: askpass helper drift guard (audit E1)
+        run: |
+          expected=7def3e86a3edf8ff28018081f14a6e390790cb102fd06c27c3f7040b07464303
+          test -f scripts/molecule-askpass || { echo "::error::scripts/molecule-askpass is missing"; exit 1; }
+          actual=$(sha256sum scripts/molecule-askpass | cut -d' ' -f1)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::scripts/molecule-askpass drifted from the pinned cross-template sha256."
+            echo "  expected $expected"
+            echo "  actual   $actual"
+            echo "  If this change is intentional, apply it identically to EVERY workspace template and bump this pin in each template's ci.yml."
+            exit 1
+          fi
+          echo "askpass pin OK ($actual)"
       # Shell lint the boot + provider/MCP helper scripts. These are
       # the load-bearing scripts for the codex list_peers-401 fix and
       # the agent-owned-token contract — a syntax slip here would ship
