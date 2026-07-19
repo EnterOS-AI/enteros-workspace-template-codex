@@ -83,10 +83,37 @@ jobs:
             echo "runtime-version/requirements pin agree: ${v:-} == ${req:-<none>}"
           fi
 
+  detect-image-change:
+    # Decouple publish from promote (task #261 build-off-box: split build from
+    # deploy). Classifies the triggering event so promote-pin + verify-pin move
+    # the STAGING runtime pin ONLY on a real image-content change or an explicit
+    # workflow_dispatch — NEVER as a side-effect of landing a workflow/docs-only
+    # change (e.g. this off-box runner-label edit). Logic lives in the shared,
+    # byte-identical .gitea/scripts/detect-image-change.sh (SSOT).
+    name: Classify change (decouple publish from promote)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      image_changed: ${{ steps.detect.outputs.image_changed }}
+    steps:
+      - name: Checkout (need the pushed range to diff)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 2
+      - id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          chmod +x .gitea/scripts/detect-image-change.sh
+          .gitea/scripts/detect-image-change.sh
+
   publish:
     name: Build & push workspace-template-codex image
     # OFF-BOX on robot-1's dedicated build fleet (was `ci-meta` on the prod
-    # host). `[docker-host, robot-1]` = AND semantics, so it lands ONLY on a
+    # host). `[docker-host, molecule-heavy]` = AND semantics, so it lands ONLY on a
     # robot-1 fleet runner while still satisfying any docker-host-pinned lint.
     # The 1.7-2.4GB image is built + `--load`ed into robot-1's daemon, smoke-
     # tested, then published to registry.moleculesai.app via the SSOT parallel
@@ -96,7 +123,7 @@ jobs:
     # `docker push` of the monolithic layers 413s). Remote runners cannot reach
     # the prod host's localhost:3200, so the registry (uncapped GET pulls) is the
     # artifact SSOT that promote-pin points the runtime at.
-    runs-on: [docker-host, robot-1]
+    runs-on: [docker-host, molecule-heavy]
     timeout-minutes: 45
     needs: resolve-version
     # Bubble the Push step's digest to the job level so the downstream
@@ -294,8 +321,8 @@ jobs:
     name: Promote runtime_image_pins (CP admin)
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    needs: [resolve-version, publish]
-    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    needs: [resolve-version, publish, detect-image-change]
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.detect-image-change.outputs.image_changed == 'true' }}
     permissions:
       contents: read
     strategy:
@@ -373,8 +400,8 @@ jobs:
     name: Verify runtime_image_pins moved (fail-loud)
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    needs: [resolve-version, publish, promote-pin]
-    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    needs: [resolve-version, publish, promote-pin, detect-image-change]
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.detect-image-change.outputs.image_changed == 'true' }}
     permissions:
       contents: read
     strategy:
