@@ -176,6 +176,37 @@ jobs:
           mkdir -p "$H/.docker"
           echo "HOME=$H" >> "$GITHUB_ENV"
           echo "DOCKER_CONFIG=$H/.docker" >> "$GITHUB_ENV"
+      - name: Fetch AUTO_SYNC_TOKEN from Infisical SSOT
+        # The scoped cross-repo read token used to fetch the SSOT chunked pusher
+        # from the PRIVATE molecule-ai/operator-config repo. Sourced from the
+        # Infisical SSOT (/shared/dev-utils::AUTO_SYNC_TOKEN, environment=prod)
+        # via the CI machine identity — the exact same source + step molecule-core's
+        # publish-workspace-server-image uses (NOT the stale org `AUTO_SYNC_TOKEN`
+        # secret, which 401s). FORK SAFETY: this workflow has no pull_request
+        # trigger, so the trio is never exposed to a fork; the conditional is
+        # belt-and-suspenders (Gitea also withholds secrets from fork runners).
+        id: auto_sync_token
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login"             -H 'Content-Type: application/json'             -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}"             | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2"               -H "Authorization: Bearer $TOK"               | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          AUTO_SYNC_TOKEN=$(read_secret AUTO_SYNC_TOKEN %2Fshared%2Fdev-utils)
+          echo "::add-mask::$AUTO_SYNC_TOKEN"
+          if [ -z "$AUTO_SYNC_TOKEN" ]; then
+            echo "::error::Infisical returned empty for AUTO_SYNC_TOKEN at /shared/dev-utils"
+            exit 1
+          fi
+          echo "AUTO_SYNC_TOKEN=$AUTO_SYNC_TOKEN" >> "$GITHUB_ENV"
+          echo "AUTO_SYNC_TOKEN loaded from Infisical (len=${#AUTO_SYNC_TOKEN})"
+
       - name: Verify Docker daemon access
         run: |
           set -euo pipefail
@@ -250,7 +281,7 @@ jobs:
           REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
           # Cross-repo read token to fetch the pusher from the private
           # operator-config repo (org-level secret; same one molecule-core uses).
-          AUTO_SYNC_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+          AUTO_SYNC_TOKEN: ${{ env.AUTO_SYNC_TOKEN }}
           PUSHER_REF: ${{ vars.OPERATOR_CONFIG_PUSHER_REF || 'main' }}
         run: |
           set -euo pipefail
