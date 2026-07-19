@@ -48,12 +48,14 @@ if [ "$EVENT_NAME" != "push" ]; then
   exit 0
 fi
 
-ZERO='0000000000000000000000000000000000000000'
 BEFORE="${BEFORE_SHA:-}"
 AFTER="${AFTER_SHA:-}"
 [ -n "$AFTER" ] || AFTER="$(git rev-parse HEAD 2>/dev/null || true)"
 
-if [ -z "$BEFORE" ] || [ "$BEFORE" = "$ZERO" ] || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+# A new-branch push sends an all-zero BEFORE. Detect "absent/all-zero" as
+# "contains no non-zero hex digit" rather than matching a 40-char zero literal
+# (a bare 40-char quoted token trips the CI secret-scan false-positive pattern).
+if [ -z "$BEFORE" ] || ! printf '%s' "$BEFORE" | grep -Eq '[1-9a-fA-F]' || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
   # New-branch push (all-zero BEFORE) or an unfetched base: diff the tip commit
   # against its first parent when one exists.
   if git rev-parse -q --verify "${AFTER}^" >/dev/null 2>&1; then
