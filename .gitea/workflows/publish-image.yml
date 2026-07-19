@@ -7,11 +7,12 @@ name: publish-image
 # main builds the current T4-capable image, publishes it to Gitea OCI,
 # and promotes the resulting content-addressed pin.
 #
-# The publish flow remains repository-local because its co-located registry
-# endpoint, smoke gate, and pin promotion are template-specific.
+# The publish flow remains repository-local because its smoke gate and pin
+# promotion are template-specific.
 #
-# The canonical pull host is registry.moleculesai.app; the co-located
-# runner pushes through localhost:3200 to bypass Cloudflare's
+# The build runs OFF-BOX on robot-1's fleet and pushes the multi-GB layers to
+# registry.moleculesai.app THROUGH the Cloudflare tunnel via the SSOT parallel
+# chunked pusher (uploads each blob in <=90MB chunks), staying under Cloudflare's
 # request-body limit for large layers.
 #
 # Workflow compatibility choices:
@@ -35,22 +36,15 @@ on:
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
   # CANONICAL content-addressed registry host (Cloudflare-fronted alias) -
-  # used for the promoted PIN ref and the image labels (IMAGE_NAME@<digest>).
+  # used for the build/smoke tag, the promoted PIN ref, and the image labels
+  # (IMAGE_NAME@<digest>). The 1.7-2.4GB image is published here THROUGH the
+  # Cloudflare tunnel by the SSOT parallel chunked pusher (see the publish job),
+  # which uploads each blob in <=90MB contiguous chunks so no request body hits
+  # the CF Free ~100MB cap (a plain `docker push` of the monolithic layers 413s).
+  # Uncapped GET pulls make this registry the artifact SSOT the runtime pin
+  # points at. (Was previously pushed CF-bypass to localhost:3200 on the prod
+  # host's ci-meta runner; that host-coupling is retired now the build is off-box.)
   IMAGE_NAME: registry.moleculesai.app/molecule-ai/workspace-template-codex
-  # CF-BYPASS local push endpoint. registry.moleculesai.app is Cloudflare-
-  # fronted with a ~100MB request-body cap, but buildx/docker uploads the
-  # 1.7-2.4GB template layers as a monolithic blob PUT -> Cloudflare 413
-  # Payload Too Large. Push straight to the local Gitea OCI endpoint instead:
-  # the runner mounts the host docker.sock, so docker login/push execute
-  # against the HOST docker daemon, where `localhost:3200` is the host's
-  # Gitea port-map (an insecure-OK localhost registry - no TLS / insecure-
-  # registries config required). It is the SAME Gitea backend that serves
-  # registry.moleculesai.app, so the pushed manifest is content-addressed
-  # and host-independent and the canonical-host pin resolves + pulls
-  # identically. Mirrors the Track-A Phase-1 host-side seed (blobs pushed
-  # direct to the local Gitea, not via the Cloudflare alias).
-  PUSH_HOST: localhost:3200
-  PUSH_IMAGE_NAME: localhost:3200/molecule-ai/workspace-template-codex
 
 permissions:
   contents: read
@@ -91,19 +85,19 @@ jobs:
 
   publish:
     name: Build & push workspace-template-codex image
-    # CF-bypass (Cloudflare 413): this job PUSHES the 1.7-2.4GB image to the
-    # Gitea OCI registry. registry.moleculesai.app is Cloudflare-fronted with a
-    # ~100MB request-body cap, so a monolithic blob PUT of the layers 413s. The
-    # push therefore has to run on a runner CO-LOCATED with the local Gitea,
-    # where `localhost:3200` is the host's registry port and docker login/push
-    # execute against the HOST docker daemon (this runner mounts the host
-    # /var/run/docker.sock; act_runner docker_host = that sock). The local
-    # `ci-meta` runner satisfies this. The dedicated remote `[publish, release]`
-    # runners CANNOT reach the host's localhost:3200 (verified: `docker login
-    # localhost:3200` -> dial tcp 127.0.0.1:3200: connection refused), so they
-    # must not run this job while the registry is served locally + CF-fronted.
-    runs-on: ci-meta
-    timeout-minutes: 30
+    # OFF-BOX on robot-1's dedicated build fleet (was `ci-meta` on the prod
+    # host). `[docker-host, robot-1]` = AND semantics, so it lands ONLY on a
+    # robot-1 fleet runner while still satisfying any docker-host-pinned lint.
+    # The 1.7-2.4GB image is built + `--load`ed into robot-1's daemon, smoke-
+    # tested, then published to registry.moleculesai.app via the SSOT parallel
+    # chunked pusher (molecule-ai/operator-config bin/registry-parallel-push.py)
+    # THROUGH the Cloudflare tunnel: each blob uploads in <=90MB contiguous
+    # chunks, so no PATCH hits the CF Free ~100MB request-body cap (a plain
+    # `docker push` of the monolithic layers 413s). Remote runners cannot reach
+    # the prod host's localhost:3200, so the registry (uncapped GET pulls) is the
+    # artifact SSOT that promote-pin points the runtime at.
+    runs-on: [docker-host, robot-1]
+    timeout-minutes: 45
     needs: resolve-version
     # Bubble the Push step's digest to the job level so the downstream
     # `promote-pin` job can consume `needs.publish.outputs.digest`. Without
@@ -144,41 +138,17 @@ jobs:
           fi
           echo "::notice::no bare imports of runtime modules in *.py files"
 
-      - name: Log in to our container registry (Gitea OCI - CF-bypass local push endpoint)
-        # Push to the Gitea-backed OCI registry at registry.moleculesai.app. The push
-        # credential is the Gitea package-publisher, fetched from the Infisical
-        # SSOT via the CI bootstrap trio (INFISICAL_CI_*) — never hardcoded.
-        # FORK SAFETY: this workflow has no pull_request trigger (push:[main] +
-        # workflow_dispatch only) so the trio is never exposed to a fork; the
-        # conditional is belt-and-suspenders (Gitea also withholds secrets from
-        # fork runners).
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
-        env:
-          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
-          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
-          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+      - name: Prepare writable HOME + Docker config
+        # robot-1 fleet runners can have a host-owned, non-writable default HOME,
+        # so docker config/credential writes fail. Point HOME + DOCKER_CONFIG at
+        # the writable job temp dir (same fix as molecule-core's publish job).
+        shell: bash
         run: |
-          set -uo pipefail
-          BASE="https://key.moleculesai.app"
-          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
-            -H 'Content-Type: application/json' \
-            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
-          read_secret() {
-            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
-              -H "Authorization: Bearer $TOK" \
-              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
-          }
-          GITEA_USER="pypi-publisher"  # canonical least-priv publisher (write:package)
-          GITEA_TOKEN=$(read_secret MOL_PACKAGE_TOKEN %2Fci%2Fgitea-pypi-publisher)
-          echo "::add-mask::$GITEA_TOKEN"
-          if [ -z "$GITEA_USER" ] || [ -z "$GITEA_TOKEN" ]; then
-            echo "::error::Infisical returned empty registry publisher creds at /ci/gitea-pypi-publisher"
-            exit 1
-          fi
-          echo "$GITEA_TOKEN" | docker login "$PUSH_HOST" -u "$GITEA_USER" --password-stdin \
-            || { echo "::error::docker login to $PUSH_HOST failed"; exit 1; }
-          echo "::notice::logged in to $PUSH_HOST (CF-bypass local Gitea OCI) as $GITEA_USER"
+          set -euo pipefail
+          H="$RUNNER_TEMP/wt-publish-home"
+          mkdir -p "$H/.docker"
+          echo "HOME=$H" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$H/.docker" >> "$GITHUB_ENV"
       - name: Verify Docker daemon access
         run: |
           set -euo pipefail
@@ -199,7 +169,7 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: ${{ env.PUSH_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
           build-args: |
             RUNTIME_VERSION=${{ needs.resolve-version.outputs.version }}
           labels: |
@@ -210,7 +180,7 @@ jobs:
       - name: Smoke test — import every /app/*.py
         shell: bash
         env:
-          IMAGE: ${{ env.PUSH_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          IMAGE: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
         run: |
           set -eu
           docker run --rm \
@@ -229,33 +199,83 @@ jobs:
           '
           echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
 
-      - name: Push image to registry (CF-bypass local endpoint, post-smoke)
+      - name: Publish image to registry (chunked pusher through CF tunnel)
         id: push
-        # Smoke passed. Push the locally-loaded image straight to the local Gitea
-        # OCI endpoint via the HOST docker daemon with a plain `docker push` (NOT
-        # buildx): the blob upload travels host->localhost:3200 and never crosses
-        # Cloudflare, so the 1.7-2.4GB layers no longer hit the ~100MB CF request-
-        # body cap (413 Payload Too Large). The manifest digest is content-
-        # addressed and host-independent, so promote-pin still pins the CANONICAL
-        # host ref (IMAGE_NAME@<digest>), which resolves + pulls via Cloudflare
-        # all the same. Image labels are already baked by the build-load step, so
-        # no rebuild happens here. `steps.push.outputs.digest` is preserved for
-        # the downstream promote-pin job.
+        # Smoke passed. Publish the locally-loaded 1.7-2.4GB image to
+        # registry.moleculesai.app THROUGH the Cloudflare tunnel using the SSOT
+        # parallel chunked pusher (molecule-ai/operator-config
+        # bin/registry-parallel-push.py, fetched at runtime — NOT vendored, so it
+        # stays the single source of truth). It uploads each blob in <=90MB
+        # contiguous PATCH chunks, so no request body hits the CF Free ~100MB cap
+        # that 413s a plain monolithic `docker push`. Then read back the
+        # content-addressed manifest digest the registry stored (GET manifest is
+        # uncapped through CF) and pin the CANONICAL ref (IMAGE_NAME@<digest>).
+        # `steps.push.outputs.digest` is preserved for the downstream promote-pin
+        # job. Pushes the IMMUTABLE :sha tag FIRST + confirms its digest, then
+        # advances the floating :latest, so a partial publish never leaves :latest
+        # ahead of a promoted sha pin. (review #201/#141)
         shell: bash
+        env:
+          SHA: ${{ needs.resolve-version.outputs.sha }}
+          # Same registry credential SSOT molecule-core's publish uses (HTTP
+          # Basic for the pusher + the digest read-back). Org-level secret/var.
+          REG_USER: ${{ vars.MOLECULE_REGISTRY_USER || 'hongming' }}
+          REG_TOKEN: ${{ secrets.MOLECULE_REGISTRY_TOKEN }}
+          # Cross-repo read token to fetch the pusher from the private
+          # operator-config repo (org-level secret; same one molecule-core uses).
+          AUTO_SYNC_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+          PUSHER_REF: ${{ vars.OPERATOR_CONFIG_PUSHER_REF || 'main' }}
         run: |
           set -euo pipefail
-          SHA_REF="${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}"
-          docker tag "${SHA_REF}" "${PUSH_IMAGE_NAME}:latest"
-          timeout 480 docker push "${PUSH_IMAGE_NAME}:latest"
-          PUSHOUT="$(timeout 480 docker push "${SHA_REF}")"
-          printf '%s\n' "${PUSHOUT}"
-          DIGEST="$(printf '%s\n' "${PUSHOUT}" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | head -1)"
-          if [ -z "${DIGEST}" ]; then
-            echo "::error::could not parse the pushed manifest digest from docker push output"
+          REG_HOST="${IMAGE_NAME%%/*}"           # registry.moleculesai.app
+          IMAGE_REPO="${IMAGE_NAME#*/}"          # molecule-ai/workspace-template-codex
+          SHA_TAG="sha-${SHA}"
+          LOCAL_IMAGE="${IMAGE_NAME}:${SHA_TAG}"
+          if [ -z "${REG_TOKEN:-}" ]; then
+            echo "::error::MOLECULE_REGISTRY_TOKEN (org secret) not set — cannot publish"; exit 1
+          fi
+          if [ -z "${AUTO_SYNC_TOKEN:-}" ]; then
+            echo "::error::AUTO_SYNC_TOKEN (org secret) not set — cannot fetch the SSOT chunked pusher"; exit 1
+          fi
+          echo "::add-mask::$REG_TOKEN"
+          export REG_USER REG_TOKEN
+
+          # Fetch the SSOT chunked pusher from operator-config (private repo).
+          PUSHER="$RUNNER_TEMP/registry-parallel-push.py"
+          url="${GITHUB_SERVER_URL}/api/v1/repos/molecule-ai/operator-config/raw/bin/registry-parallel-push.py?ref=${PUSHER_REF}"
+          curl -fsSL -H "Authorization: token ${AUTO_SYNC_TOKEN}" "$url" -o "$PUSHER"
+          test -s "$PUSHER" || { echo "::error::fetched pusher is empty from operator-config@${PUSHER_REF}"; exit 1; }
+
+          # 1) Immutable :sha tag first (verbatim molecule-core invocation).
+          echo "::group::chunked push ${REG_HOST}/${IMAGE_REPO}:${SHA_TAG}"
+          python3 "$PUSHER" --image "$LOCAL_IMAGE" --registry "$REG_HOST" \
+            --repo "$IMAGE_REPO" --tag "$SHA_TAG" --user "$REG_USER"
+          echo "::endgroup::"
+
+          # 2) Read the content-addressed manifest digest the registry stored
+          #    (Docker-Content-Digest header; GET manifest through CF is uncapped).
+          DIGEST="$(curl -fsS -u "${REG_USER}:${REG_TOKEN}" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            -o /dev/null -D - \
+            "https://${REG_HOST}/v2/${IMAGE_REPO}/manifests/${SHA_TAG}" \
+            | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}' | head -1)"
+          if ! printf '%s' "${DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::could not read the pushed manifest digest for ${IMAGE_REPO}:${SHA_TAG}"
             exit 1
           fi
+
+          # 3) Advance floating :latest only after the sha publish + digest confirm.
+          docker tag "$LOCAL_IMAGE" "${IMAGE_NAME}:latest"
+          echo "::group::chunked push ${REG_HOST}/${IMAGE_REPO}:latest"
+          python3 "$PUSHER" --image "${IMAGE_NAME}:latest" --registry "$REG_HOST" \
+            --repo "$IMAGE_REPO" --tag "latest" --user "$REG_USER"
+          echo "::endgroup::"
+
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "::notice::pushed ${SHA_REF} + :latest to ${PUSH_HOST}; manifest digest ${DIGEST} (pins as ${IMAGE_NAME}@${DIGEST})"
+          echo "::notice::chunked-pushed ${REG_HOST}/${IMAGE_REPO}:${SHA_TAG} (digest ${DIGEST}) then :latest through the CF tunnel (pins as ${IMAGE_NAME}@${DIGEST})"
 
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to
