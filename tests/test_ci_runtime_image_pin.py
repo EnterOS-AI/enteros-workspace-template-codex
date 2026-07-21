@@ -118,13 +118,16 @@ def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> No
     assert build.count("docker build") == 1
 
     required_verifier_fragments = (
-        "docker run --rm -i --network none",
+        "docker create --interactive --name",
+        "--network none",
         "--user 1000:1000 --workdir /tmp",
         "--cap-drop ALL --security-opt no-new-privileges",
         "--pids-limit 128 --memory 768m --cpus 1",
         "--tmpfs /tmp:size=64m",
-        'mcp_built_image_e2e.py:ro"',
         '--entrypoint python3 "$T4_TAG"',
+        "/mcp_built_image_e2e.py",
+        'docker cp "$CI_ROOT/scripts/mcp_built_image_e2e.py"',
+        'docker start --attach --interactive "$MCP_VERIFY_CONTAINER"',
         '< "$MCP_ATTESTATION"',
         "grep -qxF 'mcp-built-image-e2e:sentinel:executed'",
     )
@@ -134,8 +137,11 @@ def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> No
     attested_version_assignment = 'EXPECTED_RUNTIME_VERSION="$('
     assert build.index("mcp_pin_lockstep.py") < build.index(attested_version_assignment)
     assert build.index(attested_version_assignment) < build.index("docker build")
-    assert build.index("docker build") < build.index("docker run --rm -i")
-    assert build.index("docker run --rm -i") < build.index(
+    assert "--volume" not in build
+    assert build.index("docker build") < build.index("docker create")
+    assert build.index("docker create") < build.index("docker cp")
+    assert build.index("docker cp") < build.index("docker start")
+    assert build.index("docker start") < build.index(
         "grep -qxF 'mcp-built-image-e2e:sentinel:executed'"
     )
     assert build.index("grep -qxF 'mcp-built-image-e2e:sentinel:executed'") < (
