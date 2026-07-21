@@ -9,10 +9,10 @@
 # WHY INLINE (not `uses: molecule-ai/molecule-ci/.gitea/workflows/meta-ci.yml`):
 # cross-repo `workflow_call` is NOT a trustworthy gate on Gitea Actions 1.26.4 —
 # a consumer job can be recorded green WITHOUT running the referenced steps
-# (internal#1000). This template instead anon-clones the public molecule-ci SSOT
-# at CI time and runs the canonical `scripts/meta-ci.py` directly. Same single
-# source of truth (the router lives in molecule-ci, fetched fresh every run), no
-# cross-repo `uses:` dependency.
+# (internal#1000). This template instead anonymously fetches the public molecule-ci SSOT
+# at a reviewed immutable commit and runs the canonical `scripts/meta-ci.py`
+# directly. Same single source of truth (the router lives in molecule-ci), no
+# mutable or cross-repo `uses:` dependency.
 #
 # WHY IT CANNOT BLOCK A MERGE (advisory contract):
 # the router step is `continue-on-error: true` and this workflow posts NO commit
@@ -23,10 +23,9 @@
 # is in this job's LOG, not its status colour.
 #
 # PHASE 3 PROMOTION (owner-gated, later — NOT part of adopting this template):
-# to make meta-ci enforcing, switch to calling the reusable with `advisory: false`
-# (which posts a real-state `meta-ci / required` context and fails the job on red),
-# once cross-repo execution is proven or this inline form is given a status POST +
-# `exit`. Do NOT do that here.
+# keep the repository-local execution shape, fail the job on router red, assert
+# its sentinel, and add the emitted local job context to branch protection only
+# after it is proven. Do NOT introduce a remote reusable call.
 
 name: meta-ci-advisory
 
@@ -44,16 +43,22 @@ jobs:
     name: meta (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      MOLECULE_CI_REF: 9a2fd33e4ece9e54a3e1364c74daa59336ed151b
     # ADVISORY: never block a merge while the router beds in. The router SCRIPT
     # exits nonzero on an invalid repo-meta / failed bundle; this flag only
     # governs whether THIS job's red blocks the PR (it does not).
     continue-on-error: true
     steps:
+      # Repo-controlled runners execute below, so never leave checkout auth in
+      # .git/config where a crafted repository file could read and print it.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v4
-      # Anon-clone the molecule-ci SSOT; run the CANONICAL scripts/meta-ci.py
+        with:
+          persist-credentials: false
+      # Fetch the molecule-ci SSOT by immutable SHA; run the CANONICAL scripts/meta-ci.py
       # (schemas/ is its sibling there, so schema validation is intact). Direct
-      # git-clone for the cross-repo fetch — see molecule-ci validate-plugin.yml
-      # for the Gitea 1.26.4 auth reason.
+      # immutable SHA fetch avoids unsupported cross-repository workflow/action resolution
+      # on Gitea 1.26.4.
       # One guarded step that ALWAYS exits 0, so this job's auto commit-status is
       # always green and can never block a merge (Gitea does NOT green a red step via
       # job-level continue-on-error — the explicit `exit 0` is what guarantees it).
@@ -61,13 +66,37 @@ jobs:
       - name: meta-ci router (advisory — never blocks)
         run: |
           set +e
-          python3 -m pip install --break-system-packages -q pyyaml jsonschema
-          git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
-          if [ -f .molecule-ci-canonical/scripts/meta-ci.py ]; then
-            python3 .molecule-ci-canonical/scripts/meta-ci.py --repo-root .
-            rc=$?
-            [ "$rc" -ne 0 ] && echo "::warning::meta-ci router exited $rc — ADVISORY (not blocking this PR). See log above."
-          else
-            echo "::warning::meta-ci router not yet on molecule-ci main (lands with molecule-ci#71) — advisory no-op this run."
+          rc=0
+          if ! python3 -m pip install --break-system-packages -q pyyaml jsonschema; then
+            rc=1
           fi
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "::warning::RUNNER_TEMP is missing — ADVISORY (not blocking this PR)."
+            rc=1
+          else
+            CI_ROOT="$RUNNER_TEMP/molecule-ci-ssot"
+            if [ "$rc" -eq 0 ]; then
+              if ! mkdir "$CI_ROOT"; then
+                echo "::warning::could not atomically allocate isolated molecule-ci path — ADVISORY (not blocking this PR)."
+                rc=1
+              elif ! git init -q "$CI_ROOT" ||
+                ! git -C "$CI_ROOT" remote add origin \
+                  https://git.moleculesai.app/molecule-ai/molecule-ci.git ||
+                ! git -C "$CI_ROOT" fetch -q --depth 1 origin "$MOLECULE_CI_REF" ||
+                ! git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD ||
+                ! test "$(git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"; then
+                rc=1
+              fi
+            fi
+          fi
+          if [ "$rc" -eq 0 ]; then
+            python3 "$CI_ROOT/scripts/meta-ci.py" --repo-root . \
+              | tee /tmp/meta-ci.log
+            rc=${PIPESTATUS[0]}
+          fi
+          grep -qxF 'meta-ci:sentinel:executed' /tmp/meta-ci.log || {
+            echo "::warning::meta-ci execution sentinel missing — ADVISORY (not blocking this PR)."
+            rc=1
+          }
+          [ "$rc" -ne 0 ] && echo "::warning::meta-ci router exited $rc — ADVISORY (not blocking this PR). See log above."
           exit 0

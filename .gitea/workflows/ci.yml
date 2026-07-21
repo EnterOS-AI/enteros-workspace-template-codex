@@ -282,6 +282,8 @@ jobs:
     timeout-minutes: 15
     needs: validate-static
     if: github.event.pull_request.head.repo.fork != true
+    env:
+      MOLECULE_CI_REF: 11b8598e5c0b3f0b1031733a8d5f6bc238f146a4
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -320,7 +322,6 @@ jobs:
             echo "::error::.runtime-version is missing or empty"
             exit 1
           fi
-          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           KEEP_T4_IMAGE=0
           cleanup_t4_build() {
@@ -329,6 +330,48 @@ jobs:
             fi
           }
           trap cleanup_t4_build EXIT
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+          CI_ROOT="$RUNNER_TEMP/molecule-ci-final-image-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          MCP_ATTESTATION="$RUNNER_TEMP/mcp-built-image-attestation-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"
+          MCP_E2E_LOG="$RUNNER_TEMP/mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.log"
+          mkdir "$CI_ROOT"
+          git init -q "$CI_ROOT"
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if git -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" \
+              fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci verifier fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"
+          python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py" --repo-root . --json > "$MCP_ATTESTATION"
+          EXPECTED_RUNTIME_VERSION="$(
+            python3 - "$CI_ROOT/scripts/mcp_built_image_e2e.py" "$MCP_ATTESTATION" <<'PY'
+          import importlib.util
+          from pathlib import Path
+          import sys
+
+          verifier_path = Path(sys.argv[1])
+          spec = importlib.util.spec_from_file_location(
+              "_molecule_ci_mcp_built_image_e2e", verifier_path
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("could not load immutable built-image verifier")
+          verifier = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = verifier
+          spec.loader.exec_module(verifier)
+          with Path(sys.argv[2]).open("rb") as stream:
+              print(verifier.load_attestation(stream).runtime_version)
+          PY
+          )"
           docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
           ACTUAL_RUNTIME_VERSION="$(
             docker run --rm --entrypoint python3 "$T4_TAG" \
@@ -338,6 +381,16 @@ jobs:
             echo "::error::T4 image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
             exit 1
           fi
+          docker run --rm -i --network none \
+            --user 1000:1000 --workdir /tmp \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 128 --memory 768m --cpus 1 \
+            --tmpfs /tmp:size=64m \
+            --volume "$CI_ROOT/scripts/mcp_built_image_e2e.py:/opt/molecule-ci/mcp_built_image_e2e.py:ro" \
+            --entrypoint python3 "$T4_TAG" \
+            /opt/molecule-ci/mcp_built_image_e2e.py < "$MCP_ATTESTATION" \
+            | tee "$MCP_E2E_LOG"
+          grep -qxF 'mcp-built-image-e2e:sentinel:executed' "$MCP_E2E_LOG"
           KEEP_T4_IMAGE=1
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND MCP token agent-ownership
         run: |
