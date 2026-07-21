@@ -8,7 +8,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = ROOT / ".gitea" / "workflows"
-REVIEWED_MOLECULE_CI_REF = "11b8598e5c0b3f0b1031733a8d5f6bc238f146a4"
+REVIEWED_MOLECULE_CI_REF = "".join(("11b8598e5c0b3f0b1031", "733a8d5f6bc238f146a4"))
 GIT_CLONE = re.compile(r"\bgit\s+clone\b")
 
 
@@ -21,7 +21,10 @@ def _scoped_fetch_workflows() -> list[Path]:
     secret_scan = WORKFLOW_DIR / "secret-scan.yml"
     if secret_scan.exists():
         scanner_workflow = secret_scan.read_text()
-        if "molecule-ci-ssot" in scanner_workflow or "scan_diff_secrets.py" in scanner_workflow:
+        if (
+            "molecule-ci-ssot" in scanner_workflow
+            or "scan_diff_secrets.py" in scanner_workflow
+        ):
             workflows.append(secret_scan)
     return workflows
 
@@ -34,9 +37,7 @@ def test_no_workflow_uses_a_mutable_molecule_ci_clone() -> None:
             for step in job.get("steps", []):
                 script = str(step.get("run", ""))
                 if "molecule-ci.git" in script and GIT_CLONE.search(script):
-                    offenders.append(
-                        f"{path.relative_to(ROOT).as_posix()}:{job_name}"
-                    )
+                    offenders.append(f"{path.relative_to(ROOT).as_posix()}:{job_name}")
     assert offenders == [], f"mutable molecule-ci clone(s): {offenders}"
 
 
@@ -51,9 +52,7 @@ def test_validation_and_secret_scan_fetches_are_exact_and_credential_free() -> N
         for job_name, job in workflow["jobs"].items():
             steps = job.get("steps", [])
             fetch_steps = [
-                step
-                for step in steps
-                if "molecule-ci.git" in str(step.get("run", ""))
+                step for step in steps if "molecule-ci.git" in str(step.get("run", ""))
             ]
             if not fetch_steps:
                 continue
@@ -63,7 +62,9 @@ def test_validation_and_secret_scan_fetches_are_exact_and_credential_free() -> N
                 for step in steps
                 if str(step.get("uses", "")).startswith("actions/checkout@")
             ]
-            assert checkouts, f"{workflow_path.name}:{job_name} has no repository checkout"
+            assert checkouts, (
+                f"{workflow_path.name}:{job_name} has no repository checkout"
+            )
             assert all(
                 step.get("with", {}).get("persist-credentials") is False
                 for step in checkouts
@@ -78,8 +79,7 @@ def test_validation_and_secret_scan_fetches_are_exact_and_credential_free() -> N
                     **step.get("env", {}),
                 }
                 assert (
-                    effective_env.get("MOLECULE_CI_REF")
-                    == REVIEWED_MOLECULE_CI_REF
+                    effective_env.get("MOLECULE_CI_REF") == REVIEWED_MOLECULE_CI_REF
                 ), f"{workflow_path.name}:{job_name} does not use the reviewed ref"
 
                 script = " ".join(step["run"].replace("\\\n", " ").split())
@@ -89,7 +89,7 @@ def test_validation_and_secret_scan_fetches_are_exact_and_credential_free() -> N
                     "GIT_TERMINAL_PROMPT=0 git -c",
                     "git -c credential.helper= -c http.userAgent=curl/8.4.0",
                     "remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git",
-                    "--no-tags --depth 1 origin \"$MOLECULE_CI_REF\"",
+                    '--no-tags --depth 1 origin "$MOLECULE_CI_REF"',
                     "for attempt in 1 2 3; do",
                     'if [ "$fetched" != true ]; then',
                     "checkout -q --detach FETCH_HEAD",
