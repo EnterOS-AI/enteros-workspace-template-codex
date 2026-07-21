@@ -231,11 +231,26 @@ jobs:
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
         run: |
+          set -euo pipefail
           if ! docker info >/dev/null 2>&1; then
             echo "::warning::docker daemon unreachable from runner job container — skipping Docker build smoke (runner-config gap, not a template issue)."
             exit 0
           fi
-          docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t template-test . --no-cache 2>&1 | tail -5
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 template-test \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
+          echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
   # NOT a string-match. Builds the actual image, runs it under the
@@ -264,6 +279,7 @@ jobs:
       - name: Build the runtime image
         id: build
         run: |
+          set -euo pipefail
           if ! docker info >/dev/null 2>&1; then
             echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
             exit 1
@@ -290,8 +306,21 @@ jobs:
           # Deterministic function of run-id/attempt — recomputed
           # identically in the next step (no cross-step $GITHUB_ENV
           # round-trip, which can be fragile under act_runner).
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-          docker build -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 "$T4_TAG" \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::T4 image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND MCP token agent-ownership
         run: |
           set -euo pipefail
