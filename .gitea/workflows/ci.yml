@@ -1,13 +1,13 @@
 name: CI
 
 # Codex workspace-template CI. The jobs keep protected context names stable,
-# clone canonical validation code from molecule-ci, and make runner
-# requirements explicit.
+# fetch canonical validation code from molecule-ci at a reviewed immutable
+# commit, and make runner requirements explicit.
 #
 # Workflow compatibility choices:
 #   - No `workflow_dispatch.inputs`
 #   - No `merge_group:` trigger
-#   - Canonical validator is cloned fresh instead of delegated
+#   - Canonical validator is fetched by exact SHA instead of delegated
 #   - workflow-level GITHUB_SERVER_URL pinned
 #     (feedback_act_runner_github_server_url)
 #   - No `on.push.paths:` (would permanently block path-excluded pushes;
@@ -41,6 +41,8 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  # Canonical validation tooling is reviewed and content-addressed.
+  MOLECULE_CI_REF: 11b8598e5c0b3f0b1031733a8d5f6bc238f146a4
   # HERMETIC dep policy (CI-robustness): do NOT set PIP_INDEX_URL=private —
   # it force-routes EVERY pip install (pytest, pyyaml, jsonschema, …) at the
   # private index, which serves only molecules-workspace-runtime → 404s all
@@ -69,8 +71,31 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Fetch molecule-ci canonical scripts
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - name: Fetch immutable molecule-ci canonical scripts
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       # Secret scan — most important check. Always runs, including on
       # fork PRs (no third-party code executes here).
       - name: Check for secrets
@@ -224,8 +249,31 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Fetch molecule-ci canonical scripts
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - name: Fetch immutable molecule-ci canonical scripts
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       - run: pip install pyyaml -q
       - if: hashFiles('requirements.txt') != ''
         run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
