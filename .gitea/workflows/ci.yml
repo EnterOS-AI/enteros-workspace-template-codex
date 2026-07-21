@@ -67,6 +67,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       # Secret scan — most important check. Always runs, including on
@@ -220,6 +222,8 @@ jobs:
     if: github.event.pull_request.head.repo.fork != true
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       - run: pip install pyyaml -q
@@ -231,11 +235,30 @@ jobs:
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
         run: |
+          set -euo pipefail
+          : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
+          : "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"
+          SMOKE_TAG="molecule-ai-workspace-codex-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker image rm -f "$SMOKE_TAG" >/dev/null 2>&1 || true' EXIT
           if ! docker info >/dev/null 2>&1; then
             echo "::warning::docker daemon unreachable from runner job container — skipping Docker build smoke (runner-config gap, not a template issue)."
             exit 0
           fi
-          docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$SMOKE_TAG" . --no-cache 2>&1 | tail -5
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 "$SMOKE_TAG" \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
+          echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
   # NOT a string-match. Builds the actual image, runs it under the
@@ -261,9 +284,12 @@ jobs:
     if: github.event.pull_request.head.repo.fork != true
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Build the runtime image
         id: build
         run: |
+          set -euo pipefail
           if ! docker info >/dev/null 2>&1; then
             echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
             exit 1
@@ -290,8 +316,29 @@ jobs:
           # Deterministic function of run-id/attempt — recomputed
           # identically in the next step (no cross-step $GITHUB_ENV
           # round-trip, which can be fragile under act_runner).
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-          docker build -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          KEEP_T4_IMAGE=0
+          cleanup_t4_build() {
+            if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
+              docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_t4_build EXIT
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 "$T4_TAG" \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::T4 image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
+          KEEP_T4_IMAGE=1
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND MCP token agent-ownership
         run: |
           set -euo pipefail
@@ -311,8 +358,9 @@ jobs:
           # scoped, so this can never reap a concurrent foreign run's
           # probe). This is cleanup of our own debris, NOT a gate bypass —
           # no `|| true` on the real assertions below; failure still fails.
+          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
           docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true
-          CID=$(docker run -d \
+          docker run -d \
             --name "$T4_PROBE" \
             --network host \
             --privileged \
@@ -320,8 +368,7 @@ jobs:
             -v /:/host \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --entrypoint /bin/sh \
-            "$T4_TAG" -c 'sleep 600')
-          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
+            "$T4_TAG" -c 'sleep 600' >/dev/null
 
           echo "=== Reproduce the agent-owned-token half of the REAL boot path ==="
           # start.sh (as root, pre-gosu) chowns /configs to agent so
@@ -436,13 +483,22 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Skip executable tests for external forks
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "::notice::dependency installation and repository tests are disabled for external forks"
       - run: pip install -q pytest pytest-asyncio pyyaml packaging
+        if: github.event.pull_request.head.repo.fork != true
       # The adapter credential-preflight tests (test_modernization_pr1.py)
       # import molecule_runtime.adapters.base via the _adapter fixture.
       - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
+        if: github.event.pull_request.head.repo.fork != true
       # ADR-004 adapter-socket conformance (tests/test_conformance.py) inherits
       # the SDK-owned battery molecule_plugin.adapter_conformance.AdapterConformance.
       # Install the reviewed SDK source commit directly so conformance cannot
       # silently drift when either the package registry or SDK main advances.
       - run: pip install -q "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@da42c7f2dae122aaa6f34a74c13e598a87870586"
+        if: github.event.pull_request.head.repo.fork != true
       - run: python3 -m pytest tests/ -v
+        if: github.event.pull_request.head.repo.fork != true
