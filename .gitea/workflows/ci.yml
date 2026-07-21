@@ -324,24 +324,28 @@ jobs:
           fi
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           MCP_VERIFY_CONTAINER="mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+          CI_ROOT="$RUNNER_TEMP/molecule-ci-final-image-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          MCP_ATTESTATION="$RUNNER_TEMP/mcp-built-image-attestation-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"
+          MCP_E2E_LOG="$RUNNER_TEMP/mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.log"
           KEEP_T4_IMAGE=0
           cleanup_t4_build() {
             docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
+            rm -rf -- "$CI_ROOT"
+            rm -f -- "$MCP_ATTESTATION" "$MCP_E2E_LOG"
             if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
               docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
             fi
           }
           trap cleanup_t4_build EXIT
-          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
-          CI_ROOT="$RUNNER_TEMP/molecule-ci-final-image-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-          MCP_ATTESTATION="$RUNNER_TEMP/mcp-built-image-attestation-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"
-          MCP_E2E_LOG="$RUNNER_TEMP/mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.log"
           mkdir "$CI_ROOT"
           git init -q "$CI_ROOT"
           git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
           fetched=false
           for attempt in 1 2 3; do
-            if git -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" \
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 \
+              git -c credential.helper= -c http.userAgent=curl/8.4.0 \
+              -C "$CI_ROOT" \
               fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
               fetched=true
               break

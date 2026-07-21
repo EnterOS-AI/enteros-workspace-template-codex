@@ -74,12 +74,17 @@ def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
     assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
         "docker build"
     )
+    assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
+        'mkdir "$CI_ROOT"'
+    )
     cleanup_body = build_script[
         build_script.index("cleanup_t4_build() {") : build_script.index(
             "trap cleanup_t4_build EXIT"
         )
     ]
     assert 'docker rm -f "$MCP_VERIFY_CONTAINER"' in cleanup_body
+    assert 'rm -rf -- "$CI_ROOT"' in cleanup_body
+    assert 'rm -f -- "$MCP_ATTESTATION" "$MCP_E2E_LOG"' in cleanup_body
     assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
         "docker create --interactive --name"
     )
@@ -117,6 +122,8 @@ def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> No
         "remote add origin "
         "https://git.moleculesai.app/molecule-ai/molecule-ci.git" in build
     )
+    assert "GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0" in build
+    assert "credential.helper=" in build
     assert "http.userAgent=curl/8.4.0" in build
     assert "for attempt in 1 2 3" in build
     assert 'if [ "$fetched" != true ]' in build
