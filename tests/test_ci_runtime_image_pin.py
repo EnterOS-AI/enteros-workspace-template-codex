@@ -74,6 +74,13 @@ def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
     assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
         "docker build"
     )
+    assert 'docker rm -f "$MCP_VERIFY_CONTAINER"' in build_script
+    assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
+        "docker create --interactive --name"
+    )
+    assert build_script.index(
+        'docker start --attach --interactive "$MCP_VERIFY_CONTAINER"'
+    ) < build_script.index('docker rm "$MCP_VERIFY_CONTAINER" >/dev/null')
     assert build_script.index("KEEP_T4_IMAGE=1") > build_script.index(
         "grep -qxF 'mcp-built-image-e2e:sentinel:executed'"
     )
