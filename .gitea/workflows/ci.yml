@@ -375,12 +375,14 @@ jobs:
           : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
           CI_ROOT="$RUNNER_TEMP/molecule-ci-final-image-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           MCP_ATTESTATION="$RUNNER_TEMP/mcp-built-image-attestation-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"
+          MCP_ATTESTATION_TMP="${MCP_ATTESTATION}.tmp"
+          MCP_ATTESTATION_SHA256="${MCP_ATTESTATION}.sha256"
           MCP_E2E_LOG="$RUNNER_TEMP/mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.log"
           KEEP_T4_IMAGE=0
           cleanup_t4_build() {
             docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
             rm -rf -- "$CI_ROOT"
-            rm -f -- "$MCP_ATTESTATION" "$MCP_E2E_LOG"
+            rm -f -- "$MCP_ATTESTATION" "$MCP_ATTESTATION_TMP" "$MCP_ATTESTATION_SHA256" "$MCP_E2E_LOG"
             if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
               docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
             fi
@@ -406,7 +408,12 @@ jobs:
           fi
           git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
           test "$(git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"
-          python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py" --repo-root . --json > "$MCP_ATTESTATION"
+          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py
+          python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py" --repo-root . --json > "$MCP_ATTESTATION_TMP"
+          mv "$MCP_ATTESTATION_TMP" "$MCP_ATTESTATION"
+          sha256sum "$MCP_ATTESTATION" > "$MCP_ATTESTATION_SHA256"
+          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py
+          sha256sum --check "$MCP_ATTESTATION_SHA256"
           EXPECTED_RUNTIME_VERSION="$(
             python3 - "$CI_ROOT/scripts/mcp_built_image_e2e.py" "$MCP_ATTESTATION" <<'PY'
           import importlib.util
@@ -444,8 +451,10 @@ jobs:
             --tmpfs /tmp:size=64m \
             --entrypoint python3 "$T4_TAG" \
             /mcp_built_image_e2e.py >/dev/null
+          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py
           docker cp "$CI_ROOT/scripts/mcp_built_image_e2e.py" \
             "$MCP_VERIFY_CONTAINER:/mcp_built_image_e2e.py"
+          sha256sum --check "$MCP_ATTESTATION_SHA256"
           docker start --attach --interactive "$MCP_VERIFY_CONTAINER" \
             < "$MCP_ATTESTATION" \
             | tee "$MCP_E2E_LOG"

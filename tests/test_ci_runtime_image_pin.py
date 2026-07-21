@@ -84,7 +84,10 @@ def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
     ]
     assert 'docker rm -f "$MCP_VERIFY_CONTAINER"' in cleanup_body
     assert 'rm -rf -- "$CI_ROOT"' in cleanup_body
-    assert 'rm -f -- "$MCP_ATTESTATION" "$MCP_E2E_LOG"' in cleanup_body
+    assert (
+        'rm -f -- "$MCP_ATTESTATION" "$MCP_ATTESTATION_TMP" '
+        '"$MCP_ATTESTATION_SHA256" "$MCP_E2E_LOG"' in cleanup_body
+    )
     assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
         "docker create --interactive --name"
     )
@@ -166,6 +169,24 @@ def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> No
     assert build.index("grep -qxF 'mcp-built-image-e2e:sentinel:executed'") < (
         build.index("KEEP_T4_IMAGE=1")
     )
+
+    git_seal = (
+        'git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv '
+        '"$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py '
+        "scripts/mcp_built_image_e2e.py"
+    )
+    attestation_check = 'sha256sum --check "$MCP_ATTESTATION_SHA256"'
+    checker = 'python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py"'
+    assert build.count(git_seal) == 3
+    assert build.count(attestation_check) == 2
+    assert build.index(git_seal) < build.index(checker)
+    second_seal = build.index(git_seal, build.index(checker))
+    first_check = build.index(attestation_check)
+    assert second_seal < first_check < build.index("load_attestation")
+    third_seal = build.index(git_seal, second_seal + len(git_seal))
+    second_check = build.index(attestation_check, first_check + len(attestation_check))
+    assert third_seal < build.index("docker cp") < second_check
+    assert second_check < build.index("docker start")
 
 
 def test_meta_ci_advisory_is_the_immutable_canonical_copy() -> None:
