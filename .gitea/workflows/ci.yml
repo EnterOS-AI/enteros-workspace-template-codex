@@ -232,6 +232,10 @@ jobs:
         if: hashFiles('Dockerfile') != ''
         run: |
           set -euo pipefail
+          : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
+          : "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"
+          SMOKE_TAG="molecule-ai-workspace-codex-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker image rm -f "$SMOKE_TAG" >/dev/null 2>&1 || true' EXIT
           if ! docker info >/dev/null 2>&1; then
             echo "::warning::docker daemon unreachable from runner job container — skipping Docker build smoke (runner-config gap, not a template issue)."
             exit 0
@@ -241,9 +245,9 @@ jobs:
             exit 1
           fi
           EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
-          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t template-test . --no-cache 2>&1 | tail -5
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$SMOKE_TAG" . --no-cache 2>&1 | tail -5
           ACTUAL_RUNTIME_VERSION="$(
-            docker run --rm --entrypoint python3 template-test \
+            docker run --rm --entrypoint python3 "$SMOKE_TAG" \
               -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
           )"
           if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then

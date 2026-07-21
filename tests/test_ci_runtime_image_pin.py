@@ -30,3 +30,23 @@ def test_pr_image_build_pins_and_verifies_exact_runtime(job_name: str) -> None:
     assert "importlib.metadata import version" in script
     assert 'version("molecules-workspace-runtime")' in script
     assert '"$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION"' in script
+
+    if job_name == "validate-runtime":
+        assert (
+            'SMOKE_TAG="molecule-ai-workspace-codex-smoke-'
+            '${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in script
+        )
+        assert ': "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"' in script
+        assert ': "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"' in script
+        assert '-t "$SMOKE_TAG"' in script
+        assert 'docker run --rm --entrypoint python3 "$SMOKE_TAG"' in script
+        assert 'docker image rm -f "$SMOKE_TAG"' in script
+        assert "template-test" not in script
+    else:
+        assert (
+            'T4_TAG="t4-conformance-test:'
+            '${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"' in script
+        )
+        assert '-t "$T4_TAG"' in script
+        assert 'docker run --rm --entrypoint python3 "$T4_TAG"' in script
+        assert "SMOKE_TAG" not in script
