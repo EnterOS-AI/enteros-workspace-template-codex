@@ -297,7 +297,21 @@ jobs:
             exit 1
           fi
           EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
-          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$SMOKE_TAG" . --no-cache 2>&1 | tail -5
+          # Redirect, do not pipe: `tail` must not be able to truncate the cause
+          # or own the exit status. On failure the WHOLE log is printed -- a fixed
+          # window is what made template-hermes#342 undiagnosable, and buildkit
+          # interleaves parallel stages so the failing layer can sit far from the end.
+          BUILD_LOG="$(mktemp)"
+          rc=0
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$SMOKE_TAG" . --no-cache >"$BUILD_LOG" 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::image build output ($(wc -l <"$BUILD_LOG") lines, build failed)"
+            cat "$BUILD_LOG"
+            echo "::endgroup::"
+            echo "::error::image build failed (exit $rc)"
+            exit "$rc"
+          fi
+          tail -5 "$BUILD_LOG"
           ACTUAL_RUNTIME_VERSION="$(
             docker run --rm --entrypoint python3 "$SMOKE_TAG" \
               -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
@@ -433,7 +447,21 @@ jobs:
               print(verifier.load_attestation(stream).runtime_version)
           PY
           )"
-          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          # Redirect, do not pipe: `tail` must not be able to truncate the cause
+          # or own the exit status. On failure the WHOLE log is printed -- a fixed
+          # window is what made template-hermes#342 undiagnosable, and buildkit
+          # interleaves parallel stages so the failing layer can sit far from the end.
+          BUILD_LOG="$(mktemp)"
+          rc=0
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache >"$BUILD_LOG" 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::image build output ($(wc -l <"$BUILD_LOG") lines, build failed)"
+            cat "$BUILD_LOG"
+            echo "::endgroup::"
+            echo "::error::image build failed (exit $rc)"
+            exit "$rc"
+          fi
+          tail -5 "$BUILD_LOG"
           ACTUAL_RUNTIME_VERSION="$(
             docker run --rm --entrypoint python3 "$T4_TAG" \
               -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'

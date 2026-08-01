@@ -219,3 +219,44 @@ def test_fork_prs_do_not_execute_repository_tests() -> None:
         if step.get("if") == FORK_SKIP:
             continue
         assert step.get("if") == FORK_RUN
+
+
+@pytest.mark.parametrize("job_name", ("validate-runtime", "t4-conformance"))
+def test_failing_image_build_surfaces_its_own_output(job_name: str) -> None:
+    """A failed `docker build` must print the WHOLE build log, not a fixed tail.
+
+    Both jobs used to run `docker build ... 2>&1 | tail -5`. A failing buildkit
+    run ends with the offending Dockerfile fragment and a "failed to solve ...
+    exit code: 1" summary, so those five lines are identical every time and
+    never carry the cause. On 2026-08-01 the runtime-0.4.72 bump (template-hermes#342) failed
+    there and the surviving output could not distinguish a bad pin from an
+    unreachable repo from a network blip; ruling them out took a manual sweep
+    against the live forge, and a plain rerun was green.
+
+    A larger constant would be the same defect with a different number --
+    buildkit interleaves parallel stages, so the failing layer's output can sit
+    arbitrarily far from the end. Hence: no tail on the failure path at all.
+
+    Piping also lets `tail` own the pipeline's exit status. `pipefail` is set
+    today, but that is one `set -o` away from a build failure reading green,
+    so the build is redirected to a file rather than piped.
+    """
+    script = _docker_build_script(job_name)
+
+    build_line = next(
+        line for line in script.splitlines() if line.strip().startswith("docker build")
+    )
+    # `||` is control flow, not a pipe -- drop it before looking for one.
+    piped = build_line.replace("||", "")
+    assert "|" not in piped, (
+        f"{job_name}: `docker build` is piped, so its output can be truncated and "
+        f"its exit status masked -- redirect to a file instead: {build_line.strip()}"
+    )
+    assert ">" in build_line, f"{job_name}: expected the build log to be captured to a file"
+
+    # The failure path must emit the log in full.
+    assert 'cat "$BUILD_LOG"' in script, (
+        f"{job_name}: the failure path must print the entire build log"
+    )
+    # ...and it must still fail the job.
+    assert 'exit "$rc"' in script, f"{job_name}: a failed build must fail the step"
