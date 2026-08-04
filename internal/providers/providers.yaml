@@ -912,12 +912,25 @@ runtimes:
       # drift gate (molecule-ci validate-workspace-template) enforces the
       # template can offer no platform model absent from this set.
       - name: platform
+        # 2026-08-04 — PLATFORM ARM NARROWED TO MINIMAX-ONLY (operator directive).
+        # The Moonshot vendor account (org-bd1467ed2be74ef3a0bfa43941abf167) is
+        # SUSPENDED for non-payment: every moonshot/* platform call returns HTTP 429
+        # exceeded_current_quota_error in ~200ms, 100% of the time. A paying client's
+        # SEO agent burned 2,451 failed calls over 16h while every health signal read
+        # green — and because the ids stayed user-selectable, any customer could
+        # provision a permanently dead workspace. The anthropic/* platform ids still
+        # return 200 but are narrowed out under the SAME standing directive (minimax
+        # is the platform family everywhere; cf. the runtimes.yaml note "minimax is
+        # the permanent platform default EVERYWHERE ... No moonshot default anywhere").
+        # COMMENTED, NOT DELETED — restore by uncommenting once the vendor account is
+        # funded and the operator lifts the directive. Mirrors the SDK SSOT
+        # (molecule-ai-sdk contracts/llm-registry/llm-registry.yaml, sdk#203).
         models:
-          - anthropic/claude-opus-4-7
-          - anthropic/claude-opus-4-8
-          - anthropic/claude-sonnet-4-6
-          - moonshot/kimi-k2.6
-          - moonshot/kimi-k2.5
+          # - anthropic/claude-opus-4-7
+          # - anthropic/claude-opus-4-8
+          # - anthropic/claude-sonnet-4-6
+          # - moonshot/kimi-k2.6
+          # - moonshot/kimi-k2.5
           - minimax/MiniMax-M2.7
           - minimax/MiniMax-M2.7-highspeed
           - minimax/MiniMax-M3
@@ -948,9 +961,16 @@ runtimes:
       # family (parity with claude-code/codex/openclaw). Routed via the proxy
       # OpenAI-compat surface; see the template's scripts/derive-platform-llm.sh.
       - name: platform
+        # 2026-08-04 — PLATFORM ARM NARROWED TO MINIMAX-ONLY (operator directive).
+        # The Moonshot vendor account is SUSPENDED for non-payment; every moonshot/*
+        # platform call 429s in ~200ms, 100% of the time (see the claude-code arm
+        # above for the full incident note). Kimi was hermes's historical native
+        # platform family — it is now DEAD on the platform key, so the shared minimax
+        # family is the whole platform menu here.
+        # COMMENTED, NOT DELETED — restore once the vendor account is funded.
         models:
-          - moonshot/kimi-k2.6
-          - moonshot/kimi-k2.5
+          # - moonshot/kimi-k2.6
+          # - moonshot/kimi-k2.5
           - minimax/MiniMax-M2.7
           - minimax/MiniMax-M2.7-highspeed
           - minimax/MiniMax-M3
@@ -1051,9 +1071,17 @@ runtimes:
       # `codex-minimax-` leg), so the platform default and the BYOK opt-in
       # coexist without overlap.
       - name: platform
+        # 2026-08-04 — PLATFORM ARM NARROWED TO MINIMAX-ONLY (operator directive).
+        # This arm carried no moonshot id, so nothing here was DEAD; the openai/*
+        # platform ids are narrowed out solely under the standing "minimax is the
+        # platform family everywhere" directive that motivated the moonshot removal
+        # (see the claude-code arm above). codex's OWN default_model (gpt-5.5) is
+        # unaffected: it lives on the BYOK openai-subscription / openai-api arms
+        # below, which are tenant-key and untouched.
+        # COMMENTED, NOT DELETED — restore when the directive is lifted.
         models:
-          - openai/gpt-5.4
-          - openai/gpt-5.4-mini
+          # - openai/gpt-5.4
+          # - openai/gpt-5.4-mini
           - minimax/MiniMax-M2.7
           - minimax/MiniMax-M2.7-highspeed
           - minimax/MiniMax-M3
@@ -1094,6 +1122,44 @@ runtimes:
       # colon form `minimax:MiniMax-M2.7` stays on byok-minimax below, so the
       # platform default and the BYOK opt-in coexist without overlap.
       - name: platform
+        # 2026-08-04 — openclaw's narrowing is DEFERRED. The other three runtimes'
+        # platform arms above ARE narrowed to minimax-only; this one is deliberately
+        # NOT, and the two moonshot slash ids below are still listed.
+        #
+        # WHY (this is NOT an oversight — it is a cross-repo GATE CYCLE):
+        #   * cp `verify-template-models` asserts template ⊆ registry, reading the
+        #     openclaw template's config.yaml from ITS main. Narrowing this arm while
+        #     that template still offers moonshot/kimi-k2.{5,6} reds it, so this PR
+        #     cannot merge.
+        #   * the openclaw template repo's `verify-providers-projection` asserts the
+        #     reverse, registry ⊆ template, using its SYNCED copy of THIS file — and
+        #     `sync-providers-yaml` pins that copy byte-identical to controlplane
+        #     main. So the template cannot be trimmed until this file lands first.
+        #   Each side's own gate demands the other side move first. No ordering
+        #   satisfies both, and neither may be force-merged or disabled.
+        #
+        # WHY DEFERRING IS SAFE: the create-time enforcer is molecule-core's
+        # validateRegisteredModelForRuntime, which reads the SDK SSOT
+        # (go.moleculesai.app/sdk/gen/go/llmregistry) DIRECTLY, not this mirror.
+        # molecule-ai-sdk#203 already withdrew these ids on openclaw, so once core
+        # adopts that pin (molecule-core#5056) an openclaw create on
+        # moonshot/kimi-k2.6 is REFUSED 422 UNREGISTERED_MODEL_FOR_RUNTIME — the
+        # user-facing hazard closes with or without this arm. What stays open here
+        # is only CP-side proxy routing for an id no new workspace can hold.
+        # The CARVEOUT_RUNTIME_ARM_MODELS carve-out in
+        # .gitea/scripts/llm_registry_semantic_diff.py is what lets this mirror
+        # legitimately lag the SSOT on a runtime arm; the resulting delta is
+        # reported as a NOTICE by contract-ssot-sync, by design.
+        #
+        # TO FINISH: break the cycle (operator call), then uncomment nothing here —
+        # just delete the two ids below and trim the openclaw template in the same
+        # window. Tracked by the openclaw template PR left open at
+        # molecule-ai-workspace-template-openclaw#312, which is green on every check
+        # EXCEPT sync-providers-yaml and needs only a re-run once this arm narrows.
+        #
+        # NOTE: openclaw's BYOK kimi-coding arm keeps the COLON forms
+        # (moonshot:kimi-k2.*) — those bill the TENANT's own KIMI_API_KEY against
+        # api.kimi.com/coding and are unaffected by the platform account suspension.
         models:
           - moonshot/kimi-k2.6
           - moonshot/kimi-k2.5
