@@ -190,14 +190,39 @@ runtime_config:
     # Routed through the proxy Responses surface via the `platform` provider
     # above. Must match the controlplane providers manifest's codex platform
     # set (drift-gated by molecule-ci).
-    - id: openai/gpt-5.4
-      name: GPT-5.4 (Molecule platform)
-      provider: platform
-      required_env: []
-    - id: openai/gpt-5.4-mini
-      name: GPT-5.4 mini (Molecule platform)
-      provider: platform
-      required_env: []
+    #
+    # 2026-08-04 — PLATFORM MENU NARROWED TO MINIMAX-ONLY (operator directive).
+    # WITHDRAWN, COMMENTED NOT DELETED — restore by uncommenting once the
+    # operator lifts the directive.
+    # SCOPE NOTE (read before restoring): unlike the moonshot/* withdrawals on
+    # the claude-code / hermes / openclaw menus, these two ids were LIVE AND
+    # HEALTHY. They are withdrawn purely under the standing "minimax is the
+    # platform family everywhere" directive, NOT because a vendor account died.
+    # This is the one trivially reversible removal in the 2026-08-04 sweep.
+    # Mirrors the registry SSOT: molecule-ai-sdk#203
+    # (contracts/llm-registry/llm-registry.yaml) + molecule-controlplane#2850
+    # (internal/providers/providers.yaml runtimes.codex platform arm), which
+    # withdrew the same two ids. Uncommenting here alone is NOT enough — the
+    # registry arm must be restored in the same sweep or the id fails
+    # DeriveProvider CLOSED -> 422 UNREGISTERED_MODEL_FOR_RUNTIME at create.
+    # NOTE — codex's own default_model (gpt-5.5) and the whole gpt-* roster
+    # above are BYOK (openai-subscription / openai-api, tenant key) and are
+    # UNAFFECTED. Only the platform-billed slash-form ids are withdrawn; this
+    # menu therefore offers no platform-billed entry until the directive lifts.
+    # minimax/* was deliberately NOT substituted in: codex 0.130+ is
+    # Responses-API-only and the MiniMax upstream has the Chat-vs-Responses
+    # compatibility gap documented on the `codex-minimax-m2.7` entry above, so
+    # adding it would recreate exactly the dead-menu-entry hazard this sweep
+    # closes. The registry still carries minimax/* on the codex platform arm, so
+    # MOLECULE_LLM_DEFAULT_MODEL remains a legal create-time selection.
+    # - id: openai/gpt-5.4
+    #   name: GPT-5.4 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    # - id: openai/gpt-5.4-mini
+    #   name: GPT-5.4 mini (Molecule platform)
+    #   provider: platform
+    #   required_env: []
 
   # Default required_env — the canvas surfaces this when no model is
   # picked. OPENAI_API_KEY is the documented direct path; subscription
