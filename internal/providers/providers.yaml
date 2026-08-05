@@ -912,28 +912,67 @@ runtimes:
       # drift gate (molecule-ci validate-workspace-template) enforces the
       # template can offer no platform model absent from this set.
       - name: platform
-        # 2026-08-04 — PLATFORM ARM NARROWED TO MINIMAX-ONLY (operator directive).
-        # The Moonshot vendor account (org-bd1467ed2be74ef3a0bfa43941abf167) is
-        # SUSPENDED for non-payment: every moonshot/* platform call returns HTTP 429
-        # exceeded_current_quota_error in ~200ms, 100% of the time. A paying client's
-        # SEO agent burned 2,451 failed calls over 16h while every health signal read
-        # green — and because the ids stayed user-selectable, any customer could
-        # provision a permanently dead workspace. The anthropic/* platform ids still
-        # return 200 but are narrowed out under the SAME standing directive (minimax
-        # is the platform family everywhere; cf. the runtimes.yaml note "minimax is
-        # the permanent platform default EVERYWHERE ... No moonshot default anywhere").
-        # COMMENTED, NOT DELETED — restore by uncommenting once the vendor account is
-        # funded and the operator lifts the directive. Mirrors the SDK SSOT
-        # (molecule-ai-sdk contracts/llm-registry/llm-registry.yaml, sdk#203).
+        # SELECTABLE (`models`) vs OWNED (`withdrawn_models`) - read this once;
+        # every other platform arm below refers back here. Mirrors the SDK SSOT
+        # (molecule-ai-sdk contracts/llm-registry/llm-registry.yaml, sdk#204).
+        #
+        # 2026-08-04 (morning) the four platform arms were narrowed to
+        # minimax-only after the platform's Moonshot vendor account
+        # (org-bd1467ed2be74ef3a0bfa43941abf167) was SUSPENDED for non-payment:
+        # every moonshot/* platform call returns HTTP 429
+        # exceeded_current_quota_error in ~200ms, 100% of the time. A paying
+        # client's SEO agent burned 2,451 failed calls over 16h while every
+        # health signal read green, and because the ids stayed user-selectable
+        # any customer could provision a permanently dead workspace.
+        #
+        # That narrowing was WRONG IN TWO WAYS, corrected here:
+        #
+        # (1) It withdrew five ids that were HEALTHY. Live probe of the CP
+        #     metered proxy on 2026-08-04 (staging, org-scoped bearer):
+        #         anthropic/claude-opus-4-7    HTTP 200
+        #         anthropic/claude-opus-4-8    HTTP 200
+        #         anthropic/claude-sonnet-4-6  HTTP 200
+        #         openai/gpt-5.4               HTTP 200
+        #         openai/gpt-5.4-mini          HTTP 200
+        #         moonshot/kimi-k2.6           HTTP 429  "account ... is suspended"
+        #         moonshot/kimi-k2.5           HTTP 429  "account ... is suspended"
+        #     Only the two moonshot ids were dead. The other five are RESTORED to
+        #     `models` below (and on the codex arm): workspaces already pinned to
+        #     them serve 200, so there is nothing to protect anyone from.
+        #
+        # (2) It conflated SELECTABILITY with OWNERSHIP. Dropping an id from an
+        #     arm made it unresolvable, so a workspace ALREADY pinned to it lost
+        #     MOLECULE_RESOLVED_PROVIDER - and with it the metered-proxy env AND
+        #     the raw-vendor-key strip (local_docker_workspace.go
+        #     applyLocalLLMOverride). The agent was then handed a stale
+        #     MINIMAX_API_KEY / CLAUDE_CODE_OAUTH_TOKEN and called the vendor
+        #     DIRECTLY: spend never metered, never billed. Withdrawing ids to stop
+        #     unmetered spend created a different unmetered-spend path.
+        #
+        # `withdrawn_models` is the fix for (2), and is the ONLY correct way to
+        # retire a platform id from now on. An id listed there is:
+        #   * NOT on the menu - absent from ModelsForRuntime, so the canvas does
+        #     not offer it and the create-time registered-model check refuses it
+        #     (the "permanently dead workspace" hazard stays closed), and
+        #   * STILL OWNED - DeriveProviderForPin resolves it, so an existing pin
+        #     keeps the metered proxy bearer, keeps getting its raw vendor keys
+        #     stripped, and fails LEGIBLY with the vendor's own 429 through the
+        #     meter.
+        # It MUST be disjoint from `models` on the same runtime (parseManifest
+        # fails closed otherwise). The strict DeriveProvider still refuses it, so
+        # selection-time gates are unchanged.
         models:
-          # - anthropic/claude-opus-4-7
-          # - anthropic/claude-opus-4-8
-          # - anthropic/claude-sonnet-4-6
-          # - moonshot/kimi-k2.6
-          # - moonshot/kimi-k2.5
+          - anthropic/claude-opus-4-7
+          - anthropic/claude-opus-4-8
+          - anthropic/claude-sonnet-4-6
           - minimax/MiniMax-M2.7
           - minimax/MiniMax-M2.7-highspeed
           - minimax/MiniMax-M3
+        withdrawn_models:
+          # DEAD upstream (suspended vendor account) - unselectable, still owned.
+          # Move back into `models` once the account is funded.
+          - moonshot/kimi-k2.6
+          - moonshot/kimi-k2.5
       # NAME-ONLY BYOK arms (cp#529): zero model ids → add NOTHING to the
       # platform menu (ModelsForRuntime), but wire these CONFIRMED-NON-PLATFORM
       # providers into claude-code's NATIVE prefix-routing set so the bare BYOK
@@ -961,19 +1000,19 @@ runtimes:
       # family (parity with claude-code/codex/openclaw). Routed via the proxy
       # OpenAI-compat surface; see the template's scripts/derive-platform-llm.sh.
       - name: platform
-        # 2026-08-04 — PLATFORM ARM NARROWED TO MINIMAX-ONLY (operator directive).
-        # The Moonshot vendor account is SUSPENDED for non-payment; every moonshot/*
-        # platform call 429s in ~200ms, 100% of the time (see the claude-code arm
-        # above for the full incident note). Kimi was hermes's historical native
-        # platform family — it is now DEAD on the platform key, so the shared minimax
-        # family is the whole platform menu here.
-        # COMMENTED, NOT DELETED — restore once the vendor account is funded.
+        # Kimi was hermes's historical native platform family; it is DEAD on the
+        # platform key (suspended vendor account - see the claude-code arm above
+        # for the full incident note and the models/withdrawn_models contract),
+        # so the shared minimax family is the whole selectable platform menu here.
+        # The two moonshot ids stay OWNED via withdrawn_models so an existing
+        # hermes workspace pinned to one is still metered and still stripped.
         models:
-          # - moonshot/kimi-k2.6
-          # - moonshot/kimi-k2.5
           - minimax/MiniMax-M2.7
           - minimax/MiniMax-M2.7-highspeed
           - minimax/MiniMax-M3
+        withdrawn_models:
+          - moonshot/kimi-k2.6
+          - moonshot/kimi-k2.5
       # NAME-ONLY BYOK arms (cp#529): zero model ids → no addition to the
       # platform menu, but wire hermes's CONFIRMED-NON-PLATFORM passthrough +
       # bare-vendor providers into its NATIVE prefix-routing set so the BYOK
@@ -1071,17 +1110,16 @@ runtimes:
       # `codex-minimax-` leg), so the platform default and the BYOK opt-in
       # coexist without overlap.
       - name: platform
-        # 2026-08-04 — PLATFORM ARM NARROWED TO MINIMAX-ONLY (operator directive).
-        # This arm carried no moonshot id, so nothing here was DEAD; the openai/*
-        # platform ids are narrowed out solely under the standing "minimax is the
-        # platform family everywhere" directive that motivated the moonshot removal
-        # (see the claude-code arm above). codex's OWN default_model (gpt-5.5) is
-        # unaffected: it lives on the BYOK openai-subscription / openai-api arms
-        # below, which are tenant-key and untouched.
-        # COMMENTED, NOT DELETED — restore when the directive is lifted.
+        # This arm never carried a moonshot id, so NOTHING here was ever dead -
+        # the openai/* ids were collateral in the 2026-08-04 narrowing and are
+        # RESTORED (live probe: openai/gpt-5.4 and openai/gpt-5.4-mini both HTTP
+        # 200 through the metered proxy; see the claude-code arm above). No
+        # withdrawn_models here: there is nothing to withdraw.
+        # codex's OWN default_model (gpt-5.5) is unaffected either way - it lives
+        # on the BYOK openai-subscription / openai-api arms below.
         models:
-          # - openai/gpt-5.4
-          # - openai/gpt-5.4-mini
+          - openai/gpt-5.4
+          - openai/gpt-5.4-mini
           - minimax/MiniMax-M2.7
           - minimax/MiniMax-M2.7-highspeed
           - minimax/MiniMax-M3
