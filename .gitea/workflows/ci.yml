@@ -1,13 +1,13 @@
 name: CI
 
 # Codex workspace-template CI. The jobs keep protected context names stable,
-# clone canonical validation code from molecule-ci, and make runner
-# requirements explicit.
+# fetch canonical validation code from molecule-ci at a reviewed immutable
+# commit, and make runner requirements explicit.
 #
 # Workflow compatibility choices:
 #   - No `workflow_dispatch.inputs`
 #   - No `merge_group:` trigger
-#   - Canonical validator is cloned fresh instead of delegated
+#   - Canonical validator is fetched by exact SHA instead of delegated
 #   - workflow-level GITHUB_SERVER_URL pinned
 #     (feedback_act_runner_github_server_url)
 #   - No `on.push.paths:` (would permanently block path-excluded pushes;
@@ -41,6 +41,8 @@ concurrency:
 
 env:
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  # Canonical validation tooling is reviewed and content-addressed.
+  MOLECULE_CI_REF: 11b8598e5c0b3f0b1031733a8d5f6bc238f146a4
   # HERMETIC dep policy (CI-robustness): do NOT set PIP_INDEX_URL=private —
   # it force-routes EVERY pip install (pytest, pyyaml, jsonschema, …) at the
   # private index, which serves only molecules-workspace-runtime → 404s all
@@ -67,8 +69,33 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Fetch molecule-ci canonical scripts
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+        with:
+          persist-credentials: false
+      - name: Fetch immutable molecule-ci canonical scripts
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       # Secret scan — most important check. Always runs, including on
       # fork PRs (no third-party code executes here).
       - name: Check for secrets
@@ -178,6 +205,26 @@ jobs:
               raise SystemExit("template requirement permits vulnerable runtime")
           PYEOF
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
+      # Audit E1: scripts/molecule-askpass is byte-copied across every workspace
+      # template (no shared base image yet). Pin its sha256 so an unintentional
+      # edit — or a hand-copy that drifts from its peers — reds this PR. All
+      # templates pin the SAME value; a legitimate change must update the file
+      # AND this pin in every template together (which a reviewer sees). Always
+      # fires (validate-static has no paths filter / fork guard) and feeds the
+      # required `validate` aggregate, so it is a hard gate with no secrets.
+      - name: askpass helper drift guard (audit E1)
+        run: |
+          expected=7def3e86a3edf8ff28018081f14a6e390790cb102fd06c27c3f7040b07464303
+          test -f scripts/molecule-askpass || { echo "::error::scripts/molecule-askpass is missing"; exit 1; }
+          actual=$(sha256sum scripts/molecule-askpass | cut -d' ' -f1)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::scripts/molecule-askpass drifted from the pinned cross-template sha256."
+            echo "  expected $expected"
+            echo "  actual   $actual"
+            echo "  If this change is intentional, apply it identically to EVERY workspace template and bump this pin in each template's ci.yml."
+            exit 1
+          fi
+          echo "askpass pin OK ($actual)"
       # Shell lint the boot + provider/MCP helper scripts. These are
       # the load-bearing scripts for the codex list_peers-401 fix and
       # the agent-owned-token contract — a syntax slip here would ship
@@ -200,8 +247,33 @@ jobs:
     if: github.event.pull_request.head.repo.fork != true
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Fetch molecule-ci canonical scripts
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+        with:
+          persist-credentials: false
+      - name: Fetch immutable molecule-ci canonical scripts
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       - run: pip install pyyaml -q
       - if: hashFiles('requirements.txt') != ''
         run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
@@ -211,11 +283,44 @@ jobs:
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
         run: |
+          set -euo pipefail
+          : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
+          : "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"
+          SMOKE_TAG="molecule-ai-workspace-codex-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker image rm -f "$SMOKE_TAG" >/dev/null 2>&1 || true' EXIT
           if ! docker info >/dev/null 2>&1; then
             echo "::warning::docker daemon unreachable from runner job container — skipping Docker build smoke (runner-config gap, not a template issue)."
             exit 0
           fi
-          docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
+          # Redirect, do not pipe: `tail` must not be able to truncate the cause
+          # or own the exit status. On failure the WHOLE log is printed -- a fixed
+          # window is what made template-hermes#342 undiagnosable, and buildkit
+          # interleaves parallel stages so the failing layer can sit far from the end.
+          BUILD_LOG="$(mktemp)"
+          rc=0
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$SMOKE_TAG" . --no-cache >"$BUILD_LOG" 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::image build output ($(wc -l <"$BUILD_LOG") lines, build failed)"
+            cat "$BUILD_LOG"
+            echo "::endgroup::"
+            echo "::error::image build failed (exit $rc)"
+            exit "$rc"
+          fi
+          tail -5 "$BUILD_LOG"
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 "$SMOKE_TAG" \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
+          echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
   # NOT a string-match. Builds the actual image, runs it under the
@@ -239,11 +344,16 @@ jobs:
     timeout-minutes: 15
     needs: validate-static
     if: github.event.pull_request.head.repo.fork != true
+    env:
+      MOLECULE_CI_REF: 11b8598e5c0b3f0b1031733a8d5f6bc238f146a4
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Build the runtime image
         id: build
         run: |
+          set -euo pipefail
           if ! docker info >/dev/null 2>&1; then
             echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
             exit 1
@@ -270,8 +380,115 @@ jobs:
           # Deterministic function of run-id/attempt — recomputed
           # identically in the next step (no cross-step $GITHUB_ENV
           # round-trip, which can be fragile under act_runner).
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-          docker build -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          MCP_VERIFY_CONTAINER="mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+          CI_ROOT="$RUNNER_TEMP/molecule-ci-final-image-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          MCP_ATTESTATION="$RUNNER_TEMP/mcp-built-image-attestation-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.json"
+          MCP_ATTESTATION_TMP="${MCP_ATTESTATION}.tmp"
+          MCP_ATTESTATION_SHA256="${MCP_ATTESTATION}.sha256"
+          MCP_E2E_LOG="$RUNNER_TEMP/mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}.log"
+          KEEP_T4_IMAGE=0
+          cleanup_t4_build() {
+            docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
+            rm -rf -- "$CI_ROOT"
+            rm -f -- "$MCP_ATTESTATION" "$MCP_ATTESTATION_TMP" "$MCP_ATTESTATION_SHA256" "$MCP_E2E_LOG"
+            if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
+              docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_t4_build EXIT
+          mkdir "$CI_ROOT"
+          git init -q "$CI_ROOT"
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 \
+              git -c credential.helper= -c http.userAgent=curl/8.4.0 \
+              -C "$CI_ROOT" \
+              fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci verifier fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$CI_ROOT" rev-parse HEAD)" = "$MOLECULE_CI_REF"
+          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py
+          python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py" --repo-root . --json > "$MCP_ATTESTATION_TMP"
+          mv "$MCP_ATTESTATION_TMP" "$MCP_ATTESTATION"
+          sha256sum "$MCP_ATTESTATION" > "$MCP_ATTESTATION_SHA256"
+          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py
+          sha256sum --check "$MCP_ATTESTATION_SHA256"
+          EXPECTED_RUNTIME_VERSION="$(
+            python3 - "$CI_ROOT/scripts/mcp_built_image_e2e.py" "$MCP_ATTESTATION" <<'PY'
+          import importlib.util
+          from pathlib import Path
+          import sys
+
+          verifier_path = Path(sys.argv[1])
+          spec = importlib.util.spec_from_file_location(
+              "_molecule_ci_mcp_built_image_e2e", verifier_path
+          )
+          if spec is None or spec.loader is None:
+              raise SystemExit("could not load immutable built-image verifier")
+          verifier = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = verifier
+          spec.loader.exec_module(verifier)
+          with Path(sys.argv[2]).open("rb") as stream:
+              print(verifier.load_attestation(stream).runtime_version)
+          PY
+          )"
+          # Redirect, do not pipe: `tail` must not be able to truncate the cause
+          # or own the exit status. On failure the WHOLE log is printed -- a fixed
+          # window is what made template-hermes#342 undiagnosable, and buildkit
+          # interleaves parallel stages so the failing layer can sit far from the end.
+          BUILD_LOG="$(mktemp)"
+          rc=0
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache >"$BUILD_LOG" 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::image build output ($(wc -l <"$BUILD_LOG") lines, build failed)"
+            cat "$BUILD_LOG"
+            echo "::endgroup::"
+            echo "::error::image build failed (exit $rc)"
+            exit "$rc"
+          fi
+          tail -5 "$BUILD_LOG"
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 "$T4_TAG" \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::T4 image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
+          docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
+          docker create --interactive --name "$MCP_VERIFY_CONTAINER" \
+            --network none \
+            --user 1000:1000 --workdir /tmp \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 128 --memory 768m --cpus 1 \
+            --tmpfs /tmp:size=64m \
+            --entrypoint python3 "$T4_TAG" \
+            /mcp_built_image_e2e.py >/dev/null
+          git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py scripts/mcp_built_image_e2e.py
+          docker cp "$CI_ROOT/scripts/mcp_built_image_e2e.py" \
+            "$MCP_VERIFY_CONTAINER:/mcp_built_image_e2e.py"
+          sha256sum --check "$MCP_ATTESTATION_SHA256"
+          docker start --attach --interactive "$MCP_VERIFY_CONTAINER" \
+            < "$MCP_ATTESTATION" \
+            | tee "$MCP_E2E_LOG"
+          docker rm "$MCP_VERIFY_CONTAINER" >/dev/null
+          grep -qxF 'mcp-built-image-e2e:sentinel:executed' "$MCP_E2E_LOG"
+          KEEP_T4_IMAGE=1
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND MCP token agent-ownership
         run: |
           set -euo pipefail
@@ -291,8 +508,9 @@ jobs:
           # scoped, so this can never reap a concurrent foreign run's
           # probe). This is cleanup of our own debris, NOT a gate bypass —
           # no `|| true` on the real assertions below; failure still fails.
+          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
           docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true
-          CID=$(docker run -d \
+          docker run -d \
             --name "$T4_PROBE" \
             --network host \
             --privileged \
@@ -300,8 +518,7 @@ jobs:
             -v /:/host \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --entrypoint /bin/sh \
-            "$T4_TAG" -c 'sleep 600')
-          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
+            "$T4_TAG" -c 'sleep 600' >/dev/null
 
           echo "=== Reproduce the agent-owned-token half of the REAL boot path ==="
           # start.sh (as root, pre-gosu) chowns /configs to agent so
@@ -416,13 +633,22 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Skip executable tests for external forks
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "::notice::dependency installation and repository tests are disabled for external forks"
       - run: pip install -q pytest pytest-asyncio pyyaml packaging
+        if: github.event.pull_request.head.repo.fork != true
       # The adapter credential-preflight tests (test_modernization_pr1.py)
       # import molecule_runtime.adapters.base via the _adapter fixture.
       - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
+        if: github.event.pull_request.head.repo.fork != true
       # ADR-004 adapter-socket conformance (tests/test_conformance.py) inherits
       # the SDK-owned battery molecule_plugin.adapter_conformance.AdapterConformance.
       # Install the reviewed SDK source commit directly so conformance cannot
       # silently drift when either the package registry or SDK main advances.
       - run: pip install -q "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@da42c7f2dae122aaa6f34a74c13e598a87870586"
+        if: github.event.pull_request.head.repo.fork != true
       - run: python3 -m pytest tests/ -v
+        if: github.event.pull_request.head.repo.fork != true

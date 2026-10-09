@@ -1,0 +1,20 @@
+# Byte-exact cross-repo gates -> everything here MUST be LF.
+#
+# This is the only maintained workspace template with no .gitattributes; its four
+# siblings (claude-code / hermes / openclaw / google-adk) all carry exactly these
+# rules. Three gates compare bytes:
+#   * .gitea/workflows/ci.yml "askpass helper drift guard (audit E1)" pins
+#     sha256sum scripts/molecule-askpass against a literal digest shared by all
+#     templates.
+#   * molecule-ci scripts/check-askpass-drift.py fetches that same blob from all
+#     four template repos and asserts one distinct sha256.
+#   * .gitea/workflows/sync-providers-yaml.yml byte-compares
+#     internal/providers/providers.yaml against the controlplane canonical.
+# A CRLF checkout or commit from a core.autocrlf=true box changes those bytes and
+# reds all three. Pin LF.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf
