@@ -290,7 +290,7 @@ async def test_setup_publishes_system_prompt_honoring_prompt_files(
     # exact drift that left the concierge identity-less).
     assert "STALE-GENERIC-FALLBACK" not in cfg.system_prompt
     # The base platform identity frame is always present (single builder).
-    assert "Molecule AI platform" in cfg.system_prompt
+    assert "You are a workspace on" in cfg.system_prompt
 
 
 @pytest.mark.asyncio
